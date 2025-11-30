@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    uses: tty-pt/ci/.github/workflows/all-in-one.yml@main
+    with:
+      name: libqllm
+      deps: "libvulkan-dev,vulkan-tools,glslang-tools,cmake,wget"
+      deps_pacman: "vulkan-headers,vulkan-icd-loader,vulkan-tools,glslang,cmake,wget"
+      deps_apk: "vulkan-loader,vulkan-loader-dev,vulkan-headers,vulkan-tools,cmake,xz,wget"
+      deps_rpm: "vulkan-headers,vulkan-loader,vulkan-tools,glslang,cmake,wget,g++"
+      deps_brew: "cmake"
+      publish_to: "deb,pacman,rpm,brew"
+    secrets:
+      HOST: ${{ secrets.OPENBSD_HOST }}
+      USER: ${{ secrets.OPENBSD_USER }}
+      SSH_KEY: ${{ secrets.OPENBSD_SSH_KEY }}
+      GPG_PRIVATE_KEY: ${{ secrets.OPENBSD_GPG_PRIVATE_KEY }}
+      GPG_PASSPHRASE: ${{ secrets.OPENBSD_GPG_PASSPHRASE }}
+      GPG_KEYID: ${{ secrets.OPENBSD_GPG_KEY_ID }}
+      ABUILD_PRIVATE_KEY: ${{ secrets.ABUILD_PRIVATE_KEY }}
+      ABUILD_PUBLIC_KEY: ${{ secrets.ABUILD_PUBLIC_KEY }}
+      TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
