@@ -1,12 +1,19 @@
-#include <errno.h>
-#include <llama.h>
+/* libqllm.c */
+
 #include "./../include/ttypt/qllm.h"
+
+#include <ctype.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+#include <llama.h>
+#include <gguf.h>
+
+#include <ttypt/qsys.h>
 
 struct qllm_context {
 	struct llama_model	*model;
@@ -70,6 +77,166 @@ qllm_decode_tokens(struct qllm_context *qctx,
 	return 0;
 }
 
+extern void
+qllm_backend_mem_check(int gpu, size_t *free_b, size_t *total_b);
+
+static int
+auto_ngl(const char *path, int gpu, uint32_t n_ctx, uint32_t max)
+{
+    size_t free_b, total_b;
+    struct gguf_init_params ip = { .no_alloc = true };
+    struct gguf_context *ctx;
+    size_t *layer_sizes;
+    size_t reserve;
+    size_t safety;
+    size_t usable; /* Will be set from free_b OR max */
+    size_t global;
+    size_t kv_size;
+    size_t used;
+    int n_layers;
+    int n_embd;
+    int n_tensors;
+    int ngl;
+    int i;
+
+    /* Query device memory for this GPU. */
+    qllm_backend_mem_check(gpu, &free_b, &total_b);
+
+    if (total_b == 0 || free_b == 0)
+        return 0;
+
+    /* --- Modified Logic: Use 'max' to directly set the budget if provided --- */
+    if (max > 0) {
+        /* max is expected to be in MiB, convert to bytes */
+        usable = (size_t)max;
+    } else {
+        /* Default VRAM calculation (only runs if max == 0) */
+
+        /* Keep some memory aside for driver, swapchain, etc. */
+        if (total_b <= (4ULL << 30))
+            reserve = 512ULL << 20;
+        else if (total_b <= (8ULL << 30))
+            reserve = 800ULL << 20;
+        else
+            reserve = 1024ULL << 20;
+
+        /* Extra safety margin. */
+        safety = 2348ULL << 20;
+
+        if (free_b <= reserve + safety)
+            usable = 0;
+        else
+            usable = free_b - reserve - safety;
+    }
+    /* ---------------------------------------------------------------------- */
+
+    if (usable == 0)
+        return 0;
+
+    ctx = gguf_init_from_file(path, ip);
+    if (!ctx)
+        return 0;
+
+    n_layers = (int) gguf_get_val_u32(ctx,
+        gguf_find_key(ctx, "llama.block_count"));
+    n_embd = (int) gguf_get_val_u32(ctx,
+        gguf_find_key(ctx, "llama.embedding_length"));
+    n_tensors = (int) gguf_get_n_tensors(ctx);
+
+    if (n_layers <= 0 || n_embd <= 0 || n_tensors <= 0) {
+        gguf_free(ctx);
+        return 0;
+    }
+
+    layer_sizes = calloc((size_t)n_layers, sizeof(*layer_sizes));
+    if (!layer_sizes) {
+        gguf_free(ctx);
+        return 0;
+    }
+
+    /* Global (non-layer) tensors. */
+    global = 0;
+    for (i = 0; i < n_tensors; i++) {
+        const char *name = gguf_get_tensor_name(ctx, i);
+
+        if (!name)
+            continue;
+
+        if (!strstr(name, "blk.") &&
+            !strstr(name, "layers.") &&
+            !strstr(name, "block."))
+            global += gguf_get_tensor_size(ctx, i);
+    }
+
+    /* IMPORTANT CHECK: Can the global tensors (loaded to CPU) fit in the budget? */
+    /* If the user-provided 'max' is too small to even hold the global tensors
+       which are typically small, then 0 layers can be offloaded.
+       However, if 'max' is for VRAM and 'global' is for RAM, this check might be irrelevant.
+       Assuming 'usable' is the VRAM budget for the offloaded parts,
+       we only check if the *remaining* budget is sufficient. */
+
+    if (usable <= global) {
+        /* This assumes global tensors take space in the 'usable' budget (VRAM).
+           If they are loaded to CPU RAM, this check should be removed or changed.
+           Keeping the original logic for now. */
+        free(layer_sizes);
+        gguf_free(ctx);
+        return 0;
+    }
+
+    usable -= global;
+
+    /* Per-layer tensor sizes. */
+    for (i = 0; i < n_tensors; i++) {
+        const char *name = gguf_get_tensor_name(ctx, i);
+        const char *p;
+        long l;
+
+        if (!name)
+            continue;
+
+        p = strstr(name, "blk.");
+        if (!p)
+            p = strstr(name, "layers.");
+        if (!p)
+            p = strstr(name, "block.");
+        if (!p)
+            continue;
+
+        while (*p && !isdigit((unsigned char)*p))
+            p++;
+        if (!isdigit((unsigned char)*p))
+            continue;
+
+        l = strtol(p, NULL, 10);
+        if (l < 0 || l >= n_layers)
+            continue;
+
+        layer_sizes[l] += gguf_get_tensor_size(ctx, i);
+    }
+
+    gguf_free(ctx);
+
+    /* Rough KV cost estimate: 2 * f16 * n_embd * n_ctx per layer. */
+    kv_size = (size_t) n_ctx * (size_t) n_embd * 4;
+
+    used = 0;
+    ngl = 0;
+
+    for (i = 0; i < n_layers; i++) {
+        size_t need = layer_sizes[i] + kv_size;
+
+        if (used + need > usable)
+            break;
+
+        used += need;
+        ngl++;
+    }
+
+    free(layer_sizes);
+    return ngl;
+}
+
 struct qllm_context *
 qllm_create(const struct qllm_config *cfg)
 {
@@ -78,6 +245,7 @@ qllm_create(const struct qllm_config *cfg)
 	struct llama_context_params ctx_params;
 	struct llama_sampler_chain_params chain_params;
 	int32_t n_threads;
+	int ngl;
 
 	if (!cfg || !cfg->model_path)
 		return NULL;
@@ -91,7 +259,7 @@ qllm_create(const struct qllm_config *cfg)
 	if (cfg->n_ctx > 0)
 		ctx_params.n_ctx = (uint32_t) cfg->n_ctx;
 	else
-		ctx_params.n_ctx = 2048;
+		ctx_params.n_ctx = 512;
 
 	ctx_params.n_batch = ctx_params.n_ctx;
 	ctx_params.n_ubatch = 0;
@@ -110,20 +278,34 @@ qllm_create(const struct qllm_config *cfg)
 		if (ncpu <= 0)
 			n_threads = 1;
 		else
-			n_threads = (int32_t) (ncpu > 1 ? ncpu / 2 : 1);
+			n_threads = (int32_t)(ncpu > 1 ? ncpu / 2 : 1);
 	}
 
 	ctx_params.n_threads = n_threads;
 	ctx_params.n_threads_batch = n_threads;
 
+	/* Auto-select n_gpu_layers based on VRAM and GGUF metadata. */
+	ngl = auto_ngl(cfg->model_path, 0,
+			ctx_params.n_ctx,
+			cfg->auto_ngl_max);
+	fprintf(stderr, "NGL %u\n", ngl);
+
+	model_params.split_mode = LLAMA_SPLIT_MODE_LAYER;
+
+	if (ngl > 0)
+		model_params.n_gpu_layers = ngl;
+	else
+		model_params.n_gpu_layers = 0;
+
 	qctx = calloc(1, sizeof(*qctx));
 	if (!qctx)
 		return NULL;
 
-	qctx->max_tokens = (int32_t) ctx_params.n_ctx;
+	qctx->max_tokens = (int32_t)ctx_params.n_ctx;
+	qctx->params = ctx_params;	/* <-- important: save params */
 
 	qctx->model = llama_model_load_from_file(cfg->model_path,
-						 model_params);
+	    model_params);
 	if (!qctx->model)
 		goto fail;
 
@@ -138,12 +320,13 @@ qllm_create(const struct qllm_config *cfg)
 	if (!qctx->sampler)
 		goto fail;
 
-	/* Simple greedy sampler; you can add top-k/top-p later if you want. */
 	llama_sampler_chain_add(qctx->sampler,
-				llama_sampler_init_greedy());
+	    llama_sampler_init_greedy());
 
-	qctx->token_buf = calloc(qctx->max_tokens, sizeof(*qctx->token_buf));
-	qctx->seq_ids   = calloc(qctx->max_tokens, sizeof(*qctx->seq_ids));
+	qctx->token_buf = calloc((size_t)qctx->max_tokens,
+	    sizeof(*qctx->token_buf));
+	qctx->seq_ids = calloc((size_t)qctx->max_tokens,
+	    sizeof(*qctx->seq_ids));
 	if (!qctx->token_buf || !qctx->seq_ids)
 		goto fail;
 
@@ -286,7 +469,7 @@ qllm_accum_cb(void *user, const char *chunk, size_t len)
 	acc->buf[acc->len] = '\0';
 }
 
-ssize_t
+long
 qllm_generate(struct qllm_context *qctx,
 	      const char *prompt,
 	      char *out,
@@ -362,4 +545,82 @@ qllm_embed(struct qllm_context *qctx,
 		out[i] = embd[i];
 
 	return qctx->n_embd;
+}
+
+int
+qllm_prime(struct qllm_context *qctx,
+	   const char *prompt)
+{
+	int32_t n_prompt;
+
+	if (!qctx || !qctx->ctx || !prompt)
+		return -1;
+
+	/* Limpa KV + posição, tal como fazias em fdi_init() */
+	/* llama_free(qctx->ctx); */
+	/* qctx->ctx = llama_init_from_model(qctx->model, qctx->params); */
+	/* qctx->cur_pos = 0; */
+
+	n_prompt = llama_tokenize(qctx->vocab,
+				  prompt,
+				  (int32_t)strlen(prompt),
+				  qctx->token_buf,
+				  qctx->max_tokens,
+				  true,
+				  true);
+	if (n_prompt < 0)
+		return -1;
+
+	if (n_prompt == 0)
+		return 0;
+
+	if (qllm_decode_tokens(qctx, qctx->token_buf, n_prompt) != 0)
+		return -1;
+
+	return 0;
+}
+
+int
+qllm_next(struct qllm_context *qctx,
+	  char *out,
+	  size_t out_size)
+{
+	llama_token tok;
+	char piece[256];
+	int n_piece;
+
+	if (!qctx || !qctx->ctx || !out || out_size == 0)
+		return -1;
+
+	/* Sample one token */
+	tok = llama_sampler_sample(qctx->sampler, qctx->ctx, -1);
+	llama_sampler_accept(qctx->sampler, tok);
+
+	/* Treat any EOG/EOS as end-of-generation */
+	if (llama_vocab_is_eog(qctx->vocab, tok))
+		return 0;
+
+	/* Advance KV with this token */
+	qctx->token_buf[0] = tok;
+	if (qllm_decode_tokens(qctx, qctx->token_buf, 1) != 0)
+		return -1;
+
+	/* Convert token to text piece */
+	memset(piece, 0, sizeof(piece));
+	n_piece = llama_token_to_piece(qctx->vocab,
+				       tok,
+				       piece,
+				       (int)sizeof(piece),
+				       false,
+				       true);
+	if (n_piece <= 0)
+		return -1;
+
+	if ((size_t)n_piece >= out_size)
+		n_piece = (int)(out_size - 1);
+
+	memcpy(out, piece, (size_t)n_piece);
+	out[n_piece] = '\0';
+
+	return n_piece;
 }

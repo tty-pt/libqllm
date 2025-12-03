@@ -19,6 +19,7 @@ struct qllm_config {
 	const char   *model_path; /* Required */
 	int32_t       n_ctx;      /* Context size (default 2048) */
 	int32_t       n_threads;  /* Number of CPU threads (default: half of CPUs) */
+	uint32_t      auto_ngl_max;
 };
 
 /*
@@ -39,7 +40,7 @@ qllm_free(struct qllm_context *ctx);
  * Writes into `out` (user allocated).
  * Returns number of bytes written, or -1 on error.
  */
-ssize_t
+long
 qllm_generate(struct qllm_context *ctx,
 	      const char *prompt,
 	      char *out,
@@ -78,6 +79,30 @@ qllm_embed(struct qllm_context *ctx,
 	   const char *text,
 	   float *out,
 	   size_t out_dim);
+
+/*
+ * Prime the context with a prompt.
+ *
+ * Returns:
+ *   0  on success
+ *  <0  on error
+ */
+int
+qllm_prime(struct qllm_context *ctx,
+	   const char *prompt);
+
+/*
+ * Generate the next token as text.
+ *
+ * Returns:
+ *   >0  number of bytes written to 'out' (UTF-8, NUL-terminated)
+ *    0  end of generation (EOS)
+ *   <0  error
+ */
+int
+qllm_next(struct qllm_context *ctx,
+	  char *out,
+	  size_t out_size);
 
 #ifdef __cplusplus
 }
