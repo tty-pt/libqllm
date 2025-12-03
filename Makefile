@@ -2,24 +2,31 @@ all := libqllm
 
 llamacpp := submodules/llama.cpp/build
 
-uname != uname
 uname := $(shell uname)
+uname != uname
 
+arch := $(shell uname -m)
 arch != uname -m
-arch ?= $(shell uname -m)
 
 SDK_VERSION := 1.4.328.1
 SDK_URL := https://sdk.lunarg.com/sdk/download/${SDK_VERSION}/linux/vulkansdk-linux-${arch}-${SDK_VERSION}.tar.xz
 vulkan-sdk := third_party/${SDK_VERSION}/${arch}
 
-LDLIBS := -lstdc++ -ldl -lpthread -lm -lllama -lggml -lggml-cpu
-LDLIBS-Linux := -lggml-vulkan
-LDLIBS-Darwin := -lggml-metal
 PREFIX ?= /usr
-prefix-qllm := ${DESTDIR}${PREFIX}/share/qllm
-CFLAGS := -I${prefix-qllm}/include
-LDFLAGS := -L${prefix-qllm}/lib -L${prefix-qllm}/lib64
-LDFLAGS += -Wl,-rpath,'$$ORIGIN'
+CFLAGS := -I${llamacpp}/../include -I${llamacpp}/../ggml/include
+
+GGML_STATIC-Linux := ggml-vulkan/libggml-vulkan.a
+GGML_BE-Darwin := metal
+GGML_BE := ${GGML_BE-${uname}}
+GGML := libggml.a libggml-cpu.a libggml-base.a \
+	${GGML_STATIC-${uname}}
+
+STATIC := src/libllama.a ${GGML:%=ggml/src/%}
+STATIC := ${STATIC:%=${llamacpp}/%}
+# ${vulkan-sdk}/lib/libvolk.a
+
+LDLIBS := -Wl,--whole-archive $(STATIC) -Wl,--no-whole-archive \
+          -ldl -lpthread -lm -lstdc++ -lgomp -lvulkan
 
 CMAKE_FLAGS-Linux := -DGGML_VULKAN=ON
 CMAKE_FLAGS-Darwin := -DGGML_METAL=ON
@@ -28,13 +35,9 @@ third_party-Linux := ${vulkan-sdk}/include/shaderc/shaderc.h
 
 include ./../mk/include.mk
 
-src/libqllm.o: ${DESTDIR}${PREFIX}/share/qllm/lib/libllama.so
+src/libqllm.o: $(llamacpp)/src/libllama.a
 
-$(DESTDIR)$(PREFIX)/share/qllm/lib/libllama.so: ${llamacpp}/bin/libllama.so
-	make -C ${llamacpp} install DESTDIR=${DESTDIR} \
-		PREFIX=${PREFIX}/share/qllm
-
-$(llamacpp)/bin/libllama.so: ${llamacpp}/Makefile
+$(llamacpp)/src/libllama.a: ${llamacpp}/Makefile
 	make -C ${llamacpp} -j4
 
 $(llamacpp)/Makefile: ${third_party-${uname}}
@@ -47,6 +50,8 @@ $(llamacpp)/Makefile: ${third_party-${uname}}
 		cmake .. ${CMAKE_FLAGS-${uname}} \
 			-DCMAKE_INSTALL_PREFIX:PATH=${PREFIX}/share/qllm \
 			-DLLAMA_CURL=OFF \
+			-DBUILD_SHARED_LIBS=OFF \
+			-DCMAKE_POSITION_INDEPENDENT_CODE=ON \
 			-DVulkan_INCLUDE_DIR=./../../../${vulkan-sdk}/include
 
 $(vulkan-sdk)/include/shaderc/shaderc.h:
