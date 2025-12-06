@@ -16,19 +16,38 @@ SDK_URL := https://sdk.lunarg.com/sdk/download/${SDK_VERSION}/linux/vulkansdk-li
 vulkan := third_party/${SDK_VERSION}/${arch}
 
 PREFIX ?= /usr
-CFLAGS := -I${llamacpp}/../include -I${llamacpp}/../ggml/include -I${vulkan}/include
+
+prefix-Darwin-arm64  := /opt/homebrew
+prefix-Darwin-x86_64 := /usr/local
+prefix-Darwin := ${prefix-Darwin-${arch}}
+omp := ${prefix-Darwin}/Cellar/libomp/
+omp-version := $(shell ls ${omp} | head -n 1)
+omp := ${omp}/${omp-version}
+
+CFLAGS := -g -I${llamacpp}/../include -I${llamacpp}/../ggml/include -I${vulkan}/include
+CFLAGS-Darwin := -I${omp}/include
+LDFLAGS-Darwin := -L${omp}/lib
 
 GGML_STATIC-Linux := ggml-vulkan/libggml-vulkan.a
-GGML_STATIC-Darwin := ggml-metal/libggml-metal.a
+GGML_STATIC-Darwin := ggml-metal/libggml-metal.a ggml-blas/libggml-blas.a
 GGML_BE := ${GGML_BE-${uname}}
 GGML := libggml.a libggml-cpu.a libggml-base.a \
 	${GGML_STATIC-${uname}}
 
 STATIC := src/libllama.a ${GGML:%=ggml/src/%}
 STATIC := ${STATIC:%=${llamacpp}/%}
+STATIC-Linux := -Wl,--whole-archive ${STATIC} -Wl,--no-whole-archive
+STATIC-Darwin := ${STATIC:%=-Wl,-force_load,%}
 
-LDLIBS := -Wl,--whole-archive $(STATIC) -Wl,--no-whole-archive \
-          -ldl -lpthread -lm -lstdc++ -lgomp -lvulkan
+LDLIBS-Linux := -lgomp -lvulkan
+LDLIBS-Darwin := -lomp -framework Foundation \
+	-framework CoreFoundation \
+	-framework IOKit \
+	-framework Metal \
+	-framework Accelerate
+
+LDLIBS := ${STATIC-${uname}} \
+	  -lqmap -ldl -lpthread -lm -lstdc++
 
 CMAKE_FLAGS-Linux := -DGGML_VULKAN=ON
 CMAKE_FLAGS-Darwin := -DGGML_METAL=ON

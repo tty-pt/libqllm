@@ -14,6 +14,7 @@
 #include <gguf.h>
 
 #include <ttypt/qsys.h>
+#include <ttypt/qmap.h>
 
 struct qllm_context {
 	struct llama_model	*model;
@@ -31,14 +32,14 @@ struct qllm_context {
 };
 
 static int qllm_backend_inited;
+static uint32_t qm_model, model_hd;
 
 /* Initialize llama backend exactly once. */
-static void
-qllm_backend_init_once(void)
+__attribute__((constructor)) void 
+qllm_init(void)
 {
-	if (qllm_backend_inited)
-		return;
-
+	qm_model = qmap_reg(sizeof(struct llama_model *));
+	model_hd = qmap_open(NULL, NULL, QM_STR, qm_model, 0, 0);
 	llama_backend_init();
 	qllm_backend_inited = 1;
 }
@@ -237,22 +238,49 @@ auto_ngl(const char *path, int gpu, uint32_t n_ctx, uint32_t max)
     return ngl;
 }
 
+struct llama_model *model_load(
+		const char *path,
+		int32_t n_ctx,
+		uint32_t ngl_max)
+{
+	struct llama_model_params model_params;
+	struct llama_model ** model_r, *model;
+	int ngl;
+
+	model_r = (struct llama_model **) qmap_get(model_hd, path);
+	if (model_r)
+		return *model_r;
+
+	model_params = llama_model_default_params();
+	model_params.split_mode = LLAMA_SPLIT_MODE_LAYER;
+	ngl = auto_ngl(path, 0,
+			n_ctx,
+			ngl_max);
+	if (ngl > 0)
+		model_params.n_gpu_layers = ngl;
+	else
+		model_params.n_gpu_layers = 0;
+
+	if (!(model = llama_model_load_from_file(
+			path,
+			model_params)))
+		return NULL;
+
+	qmap_put(model_hd, path, &model);
+	return model;
+}
+
 struct qllm_context *
 qllm_create(const struct qllm_config *cfg)
 {
 	struct qllm_context *qctx;
-	struct llama_model_params model_params;
 	struct llama_context_params ctx_params;
 	struct llama_sampler_chain_params chain_params;
 	int32_t n_threads;
-	int ngl;
 
 	if (!cfg || !cfg->model_path)
 		return NULL;
 
-	qllm_backend_init_once();
-
-	model_params = llama_model_default_params();
 	ctx_params = llama_context_default_params();
 	chain_params = llama_sampler_chain_default_params();
 
@@ -284,19 +312,6 @@ qllm_create(const struct qllm_config *cfg)
 	ctx_params.n_threads = n_threads;
 	ctx_params.n_threads_batch = n_threads;
 
-	/* Auto-select n_gpu_layers based on VRAM and GGUF metadata. */
-	ngl = auto_ngl(cfg->model_path, 0,
-			ctx_params.n_ctx,
-			cfg->auto_ngl_max);
-	fprintf(stderr, "NGL %u\n", ngl);
-
-	model_params.split_mode = LLAMA_SPLIT_MODE_LAYER;
-
-	if (ngl > 0)
-		model_params.n_gpu_layers = ngl;
-	else
-		model_params.n_gpu_layers = 0;
-
 	qctx = calloc(1, sizeof(*qctx));
 	if (!qctx)
 		return NULL;
@@ -304,8 +319,8 @@ qllm_create(const struct qllm_config *cfg)
 	qctx->max_tokens = (int32_t)ctx_params.n_ctx;
 	qctx->params = ctx_params;	/* <-- important: save params */
 
-	qctx->model = llama_model_load_from_file(cfg->model_path,
-	    model_params);
+	qctx->model = model_load(cfg->model_path, ctx_params.n_ctx, cfg->auto_ngl_max);
+
 	if (!qctx->model)
 		goto fail;
 
@@ -555,11 +570,6 @@ qllm_prime(struct qllm_context *qctx,
 
 	if (!qctx || !qctx->ctx || !prompt)
 		return -1;
-
-	/* Limpa KV + posição, tal como fazias em fdi_init() */
-	/* llama_free(qctx->ctx); */
-	/* qctx->ctx = llama_init_from_model(qctx->model, qctx->params); */
-	/* qctx->cur_pos = 0; */
 
 	n_prompt = llama_tokenize(qctx->vocab,
 				  prompt,
