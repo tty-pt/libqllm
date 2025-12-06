@@ -1,12 +1,16 @@
 /* metal.c */
 
+#include <IOKit/IOKitLib.h>
+#include <Metal/Metal.h>
+#include <dlfcn.h>
+#include <objc/message.h>
 #include <objc/objc.h>
 #include <objc/runtime.h>
-#include <objc/message.h>
-#include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <IOKit/IOKitLib.h>
+#include <stdlib.h>
+
+typedef id (*mtl_copy_all_t)(void);
 
 /*
  * Polyfill equivalente ao teu qllm_backend_mem_check(),
@@ -22,47 +26,43 @@
  * - A parte "free" é sempre 0 por falta de API pública.
  */
 
+
+typedef id (*mtl_copy_all_t)(void);
+
 static uint64_t
 metal_get_total_vram(int gpu_index)
 {
-	Class mtl = (Class) objc_getClass("MTLCopyAllDevices");
-	if (!mtl)
-		return 0;
+    void *handle = dlopen("/System/Library/Frameworks/Metal.framework/Metal", RTLD_LAZY);
+    if (!handle)
+        return 0;
 
-	/* Em versões modernas: use MTLCreateSystemDefaultDevice / MTLCopyAllDevices */
-	Class MTLDeviceClass = objc_getClass("MTLDevice");
-	if (!MTLDeviceClass)
-		return 0;
+    mtl_copy_all_t MTLCopyAllDevicesFunc =
+        (mtl_copy_all_t) dlsym(handle, "MTLCopyAllDevices");
+    if (!MTLCopyAllDevicesFunc)
+        return 0;
 
-	/* MTLCopyAllDevices() */
-	NSArray *(*copy_all)(void) =
-		(NSArray *(*)(void)) objc_msgSend;
-	id arr = copy_all((id) objc_getClass("MTLCopyAllDevices"));
+    id arr = MTLCopyAllDevicesFunc();
+    if (!arr)
+        return 0;
 
-	if (!arr)
-		return 0;
+    NSUInteger count =
+        ((NSUInteger (*)(id, SEL)) objc_msgSend)(arr, sel_registerName("count"));
 
-	unsigned long count =
-		(unsigned long) ((NSUInteger (*)(id, SEL)) objc_msgSend)(arr, sel_registerName("count"));
-	if (gpu_index < 0 || gpu_index >= (int)count)
-		return 0;
+    if (gpu_index < 0 || gpu_index >= (int)count)
+        return 0;
 
-	id dev =
-		((id (*)(id, SEL, NSUInteger)) objc_msgSend)(arr, sel_registerName("objectAtIndex:"), (NSUInteger) gpu_index);
+    id dev =
+        ((id (*)(id, SEL, NSUInteger)) objc_msgSend)(
+            arr,
+            sel_registerName("objectAtIndex:"),
+            (NSUInteger) gpu_index);
 
-	if (!dev)
-		return 0;
+    uint64_t ws =
+        ((uint64_t (*)(id, SEL)) objc_msgSend)(
+            dev,
+            sel_registerName("recommendedMaxWorkingSetSize"));
 
-	/* property: recommendedMaxWorkingSetSize */
-	uint64_t ws =
-		(uint64_t) ((uint64_t (*)(id, SEL)) objc_msgSend)(dev, sel_registerName("recommendedMaxWorkingSetSize"));
-
-	/*
-	 * Isto *não* é VRAM total real. É o working-set máximo recomendado.
-	 * A alternativa real é via IOKit -> IORegistry.
-	 */
-
-	return ws;
+    return ws;
 }
 
 static uint64_t
