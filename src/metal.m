@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <IOKit/IOKitLib.h>
 
 /*
  * Polyfill equivalente ao teu qllm_backend_mem_check(),
@@ -63,8 +64,6 @@ metal_get_total_vram(int gpu_index)
 
 	return ws;
 }
-
-#include <IOKit/IOKitLib.h>
 
 static uint64_t
 io_vram_total(void)
