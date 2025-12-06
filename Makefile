@@ -1,4 +1,4 @@
-all := libqllm
+all := libqllm qllmd qllm-chat
 
 libqllm-obj-y-Linux := src/vulkan.o
 libqllm-obj-y-Darwin := src/metal.o
@@ -39,14 +39,16 @@ STATIC := ${STATIC:%=${llamacpp}/%}
 STATIC-Linux := -Wl,--whole-archive ${STATIC} -Wl,--no-whole-archive
 STATIC-Darwin := ${STATIC:%=-Wl,-force_load,%}
 
-LDLIBS-Linux := -lgomp -lvulkan
-LDLIBS-Darwin := -lomp -framework Foundation \
+LDLIBS-libqllm-Linux := -lgomp -lvulkan
+LDLIBS-libqllm-Darwin := -lomp -framework Foundation \
 	-framework CoreFoundation \
 	-framework IOKit \
 	-framework Metal \
 	-framework Accelerate
 
-LDLIBS := ${STATIC-${uname}} \
+LDLIBS-qllmd := -lqsys -lndc -lqllm
+
+LDLIBS-libqllm := ${STATIC-${uname}} \
 	  -lqmap -ldl -lpthread -lm -lstdc++
 
 CMAKE_FLAGS-Linux := -DGGML_VULKAN=ON
