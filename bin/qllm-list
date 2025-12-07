@@ -1,0 +1,21 @@
+#!/bin/sh
+
+CACHE_BASE="$HOME/.cache/huggingface/hub"
+FILTER="$1"
+
+find "$HOME/.cache/huggingface/hub/" -type l -name "*.gguf" | while read -r symlink; do
+  name=$(basename "$symlink")
+  if test ! -z "$FILTER" && ! echo "$name" | grep -iq "$FILTER"; then
+    continue
+  fi
+  rel_target=$(readlink "$symlink")
+  abs_target=$(realpath -m "$(dirname "$symlink")/$rel_target")
+  hash=$(basename "$abs_target")
+  size=$(du -h "$abs_target" 2>/dev/null | cut -f1)
+  case "$size" in
+    4,0K|0)
+      continue
+      ;;
+  esac
+  printf "%-40s %8s %s\n" "$name" "$size" "$hash"
+done

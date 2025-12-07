@@ -1,0 +1,35 @@
+#!/bin/sh
+
+PATTERN="$1"
+
+if [ -z "$PATTERN" ]; then
+  echo "❌ Use: llm-path <pattern>"
+  exit 1
+fi
+
+CACHE_BASE="$HOME/.cache/huggingface/hub"
+TMP_INDEX=$(mktemp)
+
+find "$CACHE_BASE" -type l -name "*.gguf" > "$TMP_INDEX"
+
+while IFS= read -r symlink; do
+  rel_target=$(readlink "$symlink")
+  abs_target=$(cd "$(dirname "$symlink")" && realpath -m "$rel_target")
+  [ ! -f "$abs_target" ] && continue
+
+  size_kb=$(du -k "$abs_target" 2>/dev/null | cut -f1)
+  [ "$size_kb" -le 4 ] && continue  # Ignorar zerados
+
+  name=$(basename "$symlink")
+
+  case "$name" in
+    $PATTERN)
+      echo "$symlink"
+      rm -f "$TMP_INDEX"
+      exit 0
+      ;;
+  esac
+done < "$TMP_INDEX"
+
+rm -f "$TMP_INDEX"
+exit 1

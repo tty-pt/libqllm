@@ -19,7 +19,8 @@ struct qllm_config {
 	const char   *model_path; /* Required */
 	int32_t       n_ctx;      /* Context size (default 2048) */
 	int32_t       n_threads;  /* Number of CPU threads (default: half of CPUs) */
-	uint32_t      auto_ngl_max;
+	uint32_t      max_offload_bytes; /* Max byte offload */
+	int32_t      n_contexts; /* How many contexts to account for */
 };
 
 /*

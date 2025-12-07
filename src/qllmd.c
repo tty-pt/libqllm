@@ -256,12 +256,14 @@ fdi_init(fdi_t *fdi)
 		.model_path = qllm_model_path,
 		.n_ctx = 0,
 		.n_threads = 0,
-		.auto_ngl_max = MAX_MEMORY,
+		.n_contexts = 2,
+		/* .auto_ngl_max = MAX_MEMORY, */
 	};
 
 	if (fdi->ctx && fdi->ctx != general.ctx)
 		qllm_free(fdi->ctx);
 
+	fprintf(stderr, "N_CONTEXTS! %d\n", cfg.n_contexts);
 	fdi->ctx = qllm_create(&cfg);
 	/* fdi->ctx = general.ctx; */
 	if (!fdi->ctx)
@@ -330,8 +332,10 @@ setup(const char *model_path)
 {
 	struct qllm_config cfg = {
 		.model_path = model_path,
-		.n_ctx = 0,		/* use qllm defaults */
-		.n_threads = 0,		/* use qllm defaults */
+		.n_ctx = 0,
+		.n_threads = 0,
+		.n_contexts = 2,
+		/* .auto_ngl_max = MAX_MEMORY, */
 	};
 
 	snprintf(qllm_model_path, sizeof(qllm_model_path), "%s", model_path);
@@ -410,7 +414,7 @@ main(int argc, char *argv[])
 	if (stat(arg_model, &st) == 0 && S_ISREG(st.st_mode)) {
 		snprintf(model_path, sizeof(model_path), "%s", arg_model);
 	} else {
-		snprintf(cmd, sizeof(cmd), "llm-path %s", arg_model);
+		snprintf(cmd, sizeof(cmd), "qllm-path %s", arg_model);
 		fp = popen(cmd, "r");
 		CBUG(!fp || !fgets(model_path, sizeof(model_path), fp),
 				"Couldn't resolve model\n");

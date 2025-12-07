@@ -1,4 +1,5 @@
-all := libqllm qllmd qllm-chat
+all := libqllm qllmd
+INSTALL_BIN := qllmd qllm-chat qllm-path qllm-list
 
 libqllm-obj-y-Linux := src/vulkan.o
 libqllm-obj-y-Darwin := src/metal.o
@@ -55,6 +56,11 @@ CMAKE_FLAGS-Linux := -DGGML_VULKAN=ON
 CMAKE_FLAGS-Darwin := -DGGML_METAL=ON
 
 third_party-Linux := ${vulkan}/include/shaderc/shaderc.h
+
+share-dirs := ${prefix}/share/bash-completion/completions
+
+install-dirs := share/bash-completion/completions
+install-extra := share/bash-completion/completions/qllmd
 
 include ./../mk/include.mk
 

@@ -82,180 +82,198 @@ extern void
 qllm_backend_mem_check(int gpu, size_t *free_b, size_t *total_b);
 
 static int
-auto_ngl(const char *path, int gpu, uint32_t n_ctx, uint32_t max)
+auto_ngl(const char *path, int gpu, uint32_t n_ctx, uint32_t max_offload_bytes,
+	 int n_layers, int n_embd, int n_contexts)
 {
-    size_t free_b, total_b;
-    struct gguf_init_params ip = { .no_alloc = true };
-    struct gguf_context *ctx;
-    size_t *layer_sizes;
-    size_t reserve;
-    size_t safety;
-    size_t usable; /* Will be set from free_b OR max */
-    size_t global;
-    size_t kv_size;
-    size_t used;
-    int n_layers;
-    int n_embd;
-    int n_tensors;
-    int ngl;
-    int i;
+	size_t free_b, total_b;
+	struct gguf_init_params ip = { .no_alloc = true };
+	struct gguf_context *ctx;
+	size_t *layer_sizes;
+	size_t usable;
+	size_t kv_size_per_ctx;
+	size_t workspace_per_ctx;
+	size_t this_ctx_cost;
+	size_t per_other_ctx_cost;
+	size_t other_ctx_cost;
+	size_t reserve;
+	size_t used;
+	size_t largest_layer;
+	int n_tensors;
+	int ngl;
+	int i;
 
-    /* Query device memory for this GPU. */
-    qllm_backend_mem_check(gpu, &free_b, &total_b);
+	if (n_contexts <= 0)
+		n_contexts = 1;
 
-    if (total_b == 0 || free_b == 0)
-        return 0;
+	/* Query VRAM information */
+	qllm_backend_mem_check(gpu, &free_b, &total_b);
+	if (!total_b || !free_b)
+		return 0;
 
-    /* --- Modified Logic: Use 'max' to directly set the budget if provided --- */
-    if (max > 0) {
-        /* max is expected to be in MiB, convert to bytes */
-        usable = (size_t)max;
-    } else {
-        /* Default VRAM calculation (only runs if max == 0) */
+	usable = free_b;
 
-        /* Keep some memory aside for driver, swapchain, etc. */
-        if (total_b <= (4ULL << 30))
-            reserve = 512ULL << 20;
-        else if (total_b <= (8ULL << 30))
-            reserve = 800ULL << 20;
-        else
-            reserve = 1024ULL << 20;
+	if (!usable)
+		return 0;
 
-        /* Extra safety margin. */
-        safety = 2348ULL << 20;
+	/* load model metadata (gguf) */
+	ctx = gguf_init_from_file(path, ip);
+	if (!ctx)
+		return 0;
 
-        if (free_b <= reserve + safety)
-            usable = 0;
-        else
-            usable = free_b - reserve - safety;
-    }
-    /* ---------------------------------------------------------------------- */
+	n_tensors = (int) gguf_get_n_tensors(ctx);
+	if (n_layers <= 0 || n_embd <= 0 || n_tensors <= 0) {
+		gguf_free(ctx);
+		return 0;
+	}
 
-    if (usable == 0)
-        return 0;
+	layer_sizes = calloc((size_t) n_layers, sizeof(*layer_sizes));
+	if (!layer_sizes) {
+		gguf_free(ctx);
+		return 0;
+	}
 
-    ctx = gguf_init_from_file(path, ip);
-    if (!ctx)
-        return 0;
+	/* Identify per-layer tensor sizes */
+	for (i = 0; i < n_tensors; i++) {
+		const char *name = gguf_get_tensor_name(ctx, i);
+		const char *p;
+		long layer;
 
-    n_layers = (int) gguf_get_val_u32(ctx,
-        gguf_find_key(ctx, "llama.block_count"));
-    n_embd = (int) gguf_get_val_u32(ctx,
-        gguf_find_key(ctx, "llama.embedding_length"));
-    n_tensors = (int) gguf_get_n_tensors(ctx);
-
-    if (n_layers <= 0 || n_embd <= 0 || n_tensors <= 0) {
-        gguf_free(ctx);
-        return 0;
-    }
-
-    layer_sizes = calloc((size_t)n_layers, sizeof(*layer_sizes));
-    if (!layer_sizes) {
-        gguf_free(ctx);
-        return 0;
-    }
-
-    /* Global (non-layer) tensors. */
-    global = 0;
-    for (i = 0; i < n_tensors; i++) {
-        const char *name = gguf_get_tensor_name(ctx, i);
-
-        if (!name)
-            continue;
-
-        if (!strstr(name, "blk.") &&
-            !strstr(name, "layers.") &&
-            !strstr(name, "block."))
-            global += gguf_get_tensor_size(ctx, i);
-    }
-
-    /* IMPORTANT CHECK: Can the global tensors (loaded to CPU) fit in the budget? */
-    /* If the user-provided 'max' is too small to even hold the global tensors
-       which are typically small, then 0 layers can be offloaded.
-       However, if 'max' is for VRAM and 'global' is for RAM, this check might be irrelevant.
-       Assuming 'usable' is the VRAM budget for the offloaded parts,
-       we only check if the *remaining* budget is sufficient. */
-
-    if (usable <= global) {
-        /* This assumes global tensors take space in the 'usable' budget (VRAM).
-           If they are loaded to CPU RAM, this check should be removed or changed.
-           Keeping the original logic for now. */
-        free(layer_sizes);
-        gguf_free(ctx);
-        return 0;
-    }
-
-    usable -= global;
-
-    /* Per-layer tensor sizes. */
-    for (i = 0; i < n_tensors; i++) {
-        const char *name = gguf_get_tensor_name(ctx, i);
-        const char *p;
-        long l;
-
-        if (!name)
-            continue;
+		if (!name)
+			continue;
 
         p = strstr(name, "blk.");
+        if (!p) p = strstr(name, "layers.");
+        if (!p) p = strstr(name, "block.");
         if (!p)
-            p = strstr(name, "layers.");
-        if (!p)
-            p = strstr(name, "block.");
-        if (!p)
-            continue;
+			continue;
 
-        while (*p && !isdigit((unsigned char)*p))
-            p++;
-        if (!isdigit((unsigned char)*p))
-            continue;
+		while (*p && !isdigit((unsigned char)*p))
+			p++;
+		if (!isdigit((unsigned char)*p))
+			continue;
 
-        l = strtol(p, NULL, 10);
-        if (l < 0 || l >= n_layers)
-            continue;
+		layer = strtol(p, NULL, 10);
+		if (layer < 0 || layer >= n_layers)
+			continue;
 
-        layer_sizes[l] += gguf_get_tensor_size(ctx, i);
-    }
+		layer_sizes[layer] += gguf_get_tensor_size(ctx, i);
+	}
 
-    gguf_free(ctx);
+	gguf_free(ctx);
 
-    /* Rough KV cost estimate: 2 * f16 * n_embd * n_ctx per layer. */
-    kv_size = (size_t) n_ctx * (size_t) n_embd * 4;
+	/* workspace & kv calculations */
 
-    used = 0;
-    ngl = 0;
+	/* Largest single layer for scratch estimation */
+	largest_layer = 0;
+	for (i = 0; i < n_layers; i++)
+		if (layer_sizes[i] > largest_layer)
+			largest_layer = layer_sizes[i];
 
-    for (i = 0; i < n_layers; i++) {
-        size_t need = layer_sizes[i] + kv_size;
+	workspace_per_ctx = largest_layer * n_layers * 7 / 22;
 
-        if (used + need > usable)
-            break;
+	/* KV per context (scaled by n_layers, with 1.25 overhead) */
+	kv_size_per_ctx =
+		(size_t)n_ctx *
+		(size_t)n_embd *
+		4ULL *
+		(size_t)n_layers;
 
-        used += need;
-        ngl++;
-    }
+	kv_size_per_ctx += kv_size_per_ctx / 3; /* +33.3% */
 
-    free(layer_sizes);
-    return ngl;
+	/* Cost of this context */
+	this_ctx_cost = kv_size_per_ctx + workspace_per_ctx;
+
+	/* Cost per additional context: add 1.5x spike margin */
+	per_other_ctx_cost = this_ctx_cost + (this_ctx_cost >> 1);
+
+	if (n_contexts > 1)
+		other_ctx_cost =
+			per_other_ctx_cost * (size_t)(n_contexts - 1);
+	else
+		other_ctx_cost = 0;
+
+	/*   pure model-driven reserve (no vram factors) */
+	reserve  = (this_ctx_cost >> 1); /* 0.5 × this context */
+
+	if (n_contexts > 1)
+		reserve +=
+			(per_other_ctx_cost >> 1) *
+			(size_t)(n_contexts - 1); /* 0.5 × per-other */
+
+	reserve += largest_layer * 2; /* Extra load/attention slack */
+
+	/* Subtract model-driven reserve */
+	if (usable <= reserve) {
+		free(layer_sizes);
+		return 0;
+	}
+
+	usable -= reserve;
+
+	/* subtract cost of contexts */
+	if (usable <= this_ctx_cost + other_ctx_cost) {
+		free(layer_sizes);
+		return 0;
+	}
+
+	usable -= this_ctx_cost + other_ctx_cost;
+
+	/* Apply max_offload_bytes AFTER reserve and context cost */
+	if (max_offload_bytes > 0 && usable > max_offload_bytes)
+		usable = max_offload_bytes;
+
+	/* greedy layer accumulation */
+
+	used = 0;
+	ngl  = 0;
+
+	for (i = 0; i < n_layers; i++) {
+		size_t weight = layer_sizes[i];
+		size_t need   = weight + (weight * 2 / 5); /* 1.4× overhead */
+
+		if (used + need > usable)
+			break;
+
+		used += need;
+		ngl++;
+	}
+
+	free(layer_sizes);
+	return ngl;
 }
 
 struct llama_model *model_load(
 		const char *path,
 		int32_t n_ctx,
-		uint32_t ngl_max)
+		uint32_t ngl_max,
+		int32_t n_contexts)
 {
 	struct llama_model_params model_params;
 	struct llama_model ** model_r, *model;
-	int ngl;
+	int n_layers, n_embd, ngl;
 
 	model_r = (struct llama_model **) qmap_get(model_hd, path);
 	if (model_r)
 		return *model_r;
 
+	if (!n_contexts)
+		n_contexts = 1;
+
 	model_params = llama_model_default_params();
+
 	model_params.split_mode = LLAMA_SPLIT_MODE_LAYER;
-	ngl = auto_ngl(path, 0,
-			n_ctx,
-			ngl_max);
+
+	model_params.n_gpu_layers = 0;
+	if (!(model = llama_model_load_from_file(
+			path,
+			model_params)))
+		return NULL;
+
+	n_layers = llama_model_n_layer(model);
+	n_embd = llama_model_n_embd(model);
+	llama_model_free(model);
+	ngl = auto_ngl(path, 0, n_ctx, ngl_max, n_layers, n_embd, n_contexts);
+
 	if (ngl > 0)
 		model_params.n_gpu_layers = ngl;
 	else
@@ -319,7 +337,7 @@ qllm_create(const struct qllm_config *cfg)
 	qctx->max_tokens = (int32_t)ctx_params.n_ctx;
 	qctx->params = ctx_params;	/* <-- important: save params */
 
-	qctx->model = model_load(cfg->model_path, ctx_params.n_ctx, cfg->auto_ngl_max);
+	qctx->model = model_load(cfg->model_path, ctx_params.n_ctx, cfg->max_offload_bytes, cfg->n_contexts);
 
 	if (!qctx->model)
 		goto fail;

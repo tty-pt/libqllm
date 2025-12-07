@@ -1,0 +1,19 @@
+_llm_qllmd_complete()
+{
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local cache="$HOME/.cache/huggingface/hub"
+
+    # Só modelos com tamanho válido
+    local matches
+    matches=$(find "$cache" -type l -name "*.gguf" 2>/dev/null | while read -r symlink; do
+        rel_target=$(readlink "$symlink") || continue
+        abs_target=$(realpath -m "$(dirname "$symlink")/$rel_target") || continue
+        size=$(du -b "$abs_target" 2>/dev/null | cut -f1)
+        if [ "$size" -gt 4096 ]; then
+            basename "$symlink"
+        fi
+    done)
+
+    COMPREPLY=( $(compgen -W "$matches" -- "$cur") )
+}
+complete -F _llm_qllmd_complete qllmd
