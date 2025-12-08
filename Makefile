@@ -18,35 +18,32 @@ vulkan := third_party/${SDK_VERSION}/${arch}
 
 PREFIX ?= /usr
 
-omp := Cellar/libomp/
+prefix-Darwin-arm64  := /opt/homebrew
+prefix-Darwin-x86_64 := /usr/local
+prefix-Darwin := ${prefix-Darwin-${arch}}
+omp := ${prefix-Darwin}/Cellar/libomp/
 omp-version := $(shell ls ${omp} | head -n 1)
-mod-prefix-Darwin += ${omp}/${omp-version}
+omp := ${omp}/${omp-version}
 
 CFLAGS := -g -I${llamacpp}/../include -I${llamacpp}/../ggml/include -I${vulkan}/include
+CFLAGS-Darwin := -I${omp}/include
 
-ggml-Linux := ggml-vulkan/libggml-vulkan.a
-ggml-Darwin := ggml-metal/libggml-metal.a ggml-blas/libggml-blas.a
-ggml := libggml.a libggml-cpu.a libggml-base.a \
-	${ggml-${uname}}
+ggmlp := ${llamacpp}/ggml/src
 
-static := src/libllama.a ${ggml:%=ggml/src/%}
-static := ${static:%=${llamacpp}/%}
+LDFLAGS-libqllm := -L${llamacpp}/src -L${ggmlp}
+LDFLAGS-Linux := -L${ggmlp}/ggml-vulkan
+LDFLAGS-Darwin := -L${ggmlp}/ggml-metal -L${ggmlp}/ggml-blas -L${omp}/lib
 
-LDLIBS-libqllm-Linux := \
-	-Wl,--whole-archive ${static} \
-	-Wl,--no-whole-archive -lgomp -lvulkan
+LDLIBS-qllmd := -lqsys -lndc -lqllm
 
-LDLIBS-libqllm-Darwin := \
-	${static:%=-Wl,-force_load,%} \
-	-lomp -framework Foundation \
+LDLIBS-libqllm := -lllama -lggml -lggml-cpu -lggml-base -lqmap -ldl -lpthread -lm -lstdc++
+LDLIBS-libqllm-Linux := -lgomp -lvulkan -lggml-vulkan
+LDLIBS-libqllm-Darwin := -lggml-metal -lggml-blas -lomp \
+	-framework Foundation \
 	-framework CoreFoundation \
 	-framework IOKit \
 	-framework Metal \
 	-framework Accelerate
-
-LDLIBS-qllmd := -lqsys -lndc -lqllm
-
-LDLIBS-libqllm := -lqmap -ldl -lpthread -lm -lstdc++
 
 CMAKE_FLAGS-Linux := -DGGML_VULKAN=ON
 CMAKE_FLAGS-Darwin := -DGGML_METAL=ON
