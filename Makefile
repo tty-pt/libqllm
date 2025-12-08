@@ -18,30 +18,27 @@ vulkan := third_party/${SDK_VERSION}/${arch}
 
 PREFIX ?= /usr
 
-prefix-Darwin-arm64  := /opt/homebrew
-prefix-Darwin-x86_64 := /usr/local
-prefix-Darwin := ${prefix-Darwin-${arch}}
-omp := ${prefix-Darwin}/Cellar/libomp/
+omp := Cellar/libomp/
 omp-version := $(shell ls ${omp} | head -n 1)
-omp := ${omp}/${omp-version}
+mod-prefix-Darwin += ${omp}/${omp-version}
 
 CFLAGS := -g -I${llamacpp}/../include -I${llamacpp}/../ggml/include -I${vulkan}/include
-CFLAGS-Darwin := -I${omp}/include
-LDFLAGS-Darwin := -L${omp}/lib
 
-GGML_STATIC-Linux := ggml-vulkan/libggml-vulkan.a
-GGML_STATIC-Darwin := ggml-metal/libggml-metal.a ggml-blas/libggml-blas.a
-GGML_BE := ${GGML_BE-${uname}}
-GGML := libggml.a libggml-cpu.a libggml-base.a \
-	${GGML_STATIC-${uname}}
+ggml-Linux := ggml-vulkan/libggml-vulkan.a
+ggml-Darwin := ggml-metal/libggml-metal.a ggml-blas/libggml-blas.a
+ggml := libggml.a libggml-cpu.a libggml-base.a \
+	${ggml-${uname}}
 
-STATIC := src/libllama.a ${GGML:%=ggml/src/%}
-STATIC := ${STATIC:%=${llamacpp}/%}
-STATIC-Linux := -Wl,--whole-archive ${STATIC} -Wl,--no-whole-archive
-STATIC-Darwin := ${STATIC:%=-Wl,-force_load,%}
+static := src/libllama.a ${ggml:%=ggml/src/%}
+static := ${static:%=${llamacpp}/%}
 
-LDLIBS-libqllm-Linux := -lgomp -lvulkan
-LDLIBS-libqllm-Darwin := -lomp -framework Foundation \
+LDLIBS-libqllm-Linux := \
+	-Wl,--whole-archive ${static} \
+	-Wl,--no-whole-archive -lgomp -lvulkan
+
+LDLIBS-libqllm-Darwin := \
+	${static:%=-Wl,-force_load,%} \
+	-lomp -framework Foundation \
 	-framework CoreFoundation \
 	-framework IOKit \
 	-framework Metal \
@@ -49,18 +46,17 @@ LDLIBS-libqllm-Darwin := -lomp -framework Foundation \
 
 LDLIBS-qllmd := -lqsys -lndc -lqllm
 
-LDLIBS-libqllm := ${STATIC-${uname}} \
-	  -lqmap -ldl -lpthread -lm -lstdc++
+LDLIBS-libqllm := -lqmap -ldl -lpthread -lm -lstdc++
 
 CMAKE_FLAGS-Linux := -DGGML_VULKAN=ON
 CMAKE_FLAGS-Darwin := -DGGML_METAL=ON
 
 third_party-Linux := ${vulkan}/include/shaderc/shaderc.h
 
-share-dirs := ${prefix}/share/bash-completion/completions
+completions := share/bash-completion/completions
 
-install-dirs := share/bash-completion/completions
-install-extra := share/bash-completion/completions/qllmd
+install-dirs := ${completions}
+install-extra := ${completions}/qllmd
 
 include ./../mk/include.mk
 
@@ -79,6 +75,10 @@ $(llamacpp)/Makefile: ${third_party-${uname}}
 		cmake .. ${CMAKE_FLAGS-${uname}} \
 			-DCMAKE_INSTALL_PREFIX:PATH=${PREFIX}/share/qllm \
 			-DLLAMA_CURL=OFF \
+			-DLLAMA_BUILD_EXAMPLES=OFF \
+			-DLLAMA_BUILD_TESTS=OFF \
+			-DLLAMA_BUILD_SERVER=OFF \
+			-DLLAMA_BUILD_TOOLS=OFF \
 			-DBUILD_SHARED_LIBS=OFF \
 			-DCMAKE_POSITION_INDEPENDENT_CODE=ON \
 			-DVulkan_INCLUDE_DIR=./../../../${vulkan}/include

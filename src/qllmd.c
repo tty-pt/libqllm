@@ -12,7 +12,6 @@
 #define DEFAULT_SEQ_MAX 4
 #define MAX_TOKENS 1024
 #define MAX_MEMORY (MAX_TOKENS * 10)
-#define MAX_TOKEN_LEN 64
 #define FEAT_GENERAL 0
 
 struct qllm_context;
@@ -160,7 +159,7 @@ process_chunk(gen_state_t *st, const char *chunk, size_t len)
 static inline int
 inference(int fd, fdi_t *fdi)
 {
-	char	buf[MAX_TOKEN_LEN];
+	char	buf[MAX_MEMORY];
 	int	ret;
 	size_t	buflen;
 	char	*eoim;
@@ -215,7 +214,7 @@ generate(int fd, const char *prompt)
 {
 	fdi_t	*fdi = &fdis[fd];
 	int	 step;
-	int	 max_gen = MAX_TOKEN_LEN;
+	int	 max_gen = MAX_MEMORY;
 
 	/* Prime qllm context with the full prompt */
 	if (qllm_prime(fdi->ctx, prompt) < 0) {
