@@ -13,6 +13,7 @@
 #define MAX_TOKENS 1024
 #define MAX_MEMORY (MAX_TOKENS * 10)
 #define MAX_TOKEN_LEN 64
+#define FEAT_GENERAL 0
 
 struct qllm_context;
 
@@ -45,6 +46,13 @@ struct ndc_config ndc_config = {
 	.flags = NDC_DETACH,
 	.port = 4242,
 };
+
+#if FEAT_GENERAL
+unsigned n_contexts = 2;
+#else
+unsigned n_contexts = 1;
+#endif
+unsigned n_ctx = 0;
 
 static inline void
 append_to_line(fdi_t *fdi, const char *s, size_t len)
@@ -254,10 +262,9 @@ fdi_init(fdi_t *fdi)
 {
 	struct qllm_config cfg = {
 		.model_path = qllm_model_path,
-		.n_ctx = 0,
+		.n_ctx = n_ctx,
 		.n_threads = 0,
-		.n_contexts = 2,
-		/* .auto_ngl_max = MAX_MEMORY, */
+		.n_contexts = n_contexts,
 	};
 
 	if (fdi->ctx && fdi->ctx != general.ctx)
@@ -295,8 +302,11 @@ struct cmd_slot cmds[] = {
 int
 ndc_accept(int fd)
 {
+#if FEAT_GENERAL
 	fdis[fd].ctx = general.ctx;
+#else
 	reset_fdi(&fdis[fd]);
+#endif
 	return 0;
 }
 
@@ -324,27 +334,30 @@ usage(char *prog)
 	fprintf(stderr, "        -p PORT   specify server port (defaults to 4242)\n");
 	fprintf(stderr, "        -d        don't detach\n");
 	fprintf(stderr, "        -r        root multiplex mode\n");
+	fprintf(stderr, "        -c SIZE   specify n_ctx (0 - auto)\n");
+	fprintf(stderr, "        -n NUM    specify an estimation of concurrent sessions (2)\n");
 	fprintf(stderr, "        -?        display this message.\n");
 }
 
 static void
 setup(const char *model_path)
 {
+#if FEAT_GENERAL
 	struct qllm_config cfg = {
 		.model_path = model_path,
-		.n_ctx = 0,
+		.n_ctx = n_ctx,
 		.n_threads = 0,
-		.n_contexts = 2,
-		/* .auto_ngl_max = MAX_MEMORY, */
+		.n_contexts = n_contexts,
 	};
-
-	snprintf(qllm_model_path, sizeof(qllm_model_path), "%s", model_path);
 
 	general.ctx = qllm_create(&cfg);
 	CBUG(!general.ctx,
 			"Failed to create qllm context\n");
 
 	reset_fdi(&general);
+#endif
+
+	snprintf(qllm_model_path, sizeof(qllm_model_path), "%s", model_path);
 
 	crb_len = (size_t)ndc_mmap(&crb, "crb.txt");
 	(void)crb_len;
@@ -363,8 +376,9 @@ main(int argc, char *argv[])
 	int ret;
 
 	qsys_openlog("qllmd");
+	ndc_config.port = 4242;
 
-	while ((c = getopt(argc, argv, "?dK:k:C:rp:s:")) != -1) switch (c) {
+	while ((c = getopt(argc, argv, "?dK:k:C:rp:s:n:c:")) != -1) switch (c) {
 		case 'd':
 			ndc_config.flags &= ~NDC_DETACH;
 			break;
@@ -389,6 +403,14 @@ main(int argc, char *argv[])
 			ndc_config.ssl_port = atoi(optarg);
 			break;
 
+		case 'n':
+			n_contexts = atoi(optarg);
+			break;
+
+		case 'c':
+			n_ctx = atoi(optarg);
+			break;
+
 		default:
 			usage(*argv);
 			return 1;
@@ -396,7 +418,7 @@ main(int argc, char *argv[])
 
 	optind = 1;
 
-	while ((c = getopt(argc, argv, "?dK:k:C:rp:s:")) != -1) switch (c) {
+	while ((c = getopt(argc, argv, "?dK:k:C:rp:s:n:c:")) != -1) switch (c) {
 		case 'K':
 			ndc_certs_add(optarg);
 			break;

@@ -93,8 +93,9 @@ auto_ngl(const char *path, int gpu, uint32_t n_ctx, uint32_t max_offload_bytes,
 	size_t kv_size_per_ctx;
 	size_t workspace_per_ctx;
 	size_t this_ctx_cost;
-	size_t per_other_ctx_cost;
-	size_t other_ctx_cost;
+	size_t per_other_ctx_cost = 0;
+	size_t other_ctx_cost = 0;
+	size_t system_overhead;
 	size_t reserve;
 	size_t used;
 	size_t largest_layer;
@@ -105,34 +106,30 @@ auto_ngl(const char *path, int gpu, uint32_t n_ctx, uint32_t max_offload_bytes,
 	if (n_contexts <= 0)
 		n_contexts = 1;
 
-	/* Query VRAM information */
 	qllm_backend_mem_check(gpu, &free_b, &total_b);
 	if (!total_b || !free_b)
 		return 0;
 
 	usable = free_b;
-
 	if (!usable)
 		return 0;
 
-	/* load model metadata (gguf) */
 	ctx = gguf_init_from_file(path, ip);
 	if (!ctx)
 		return 0;
 
-	n_tensors = (int) gguf_get_n_tensors(ctx);
+	n_tensors = (int)gguf_get_n_tensors(ctx);
 	if (n_layers <= 0 || n_embd <= 0 || n_tensors <= 0) {
 		gguf_free(ctx);
 		return 0;
 	}
 
-	layer_sizes = calloc((size_t) n_layers, sizeof(*layer_sizes));
+	layer_sizes = calloc((size_t)n_layers, sizeof(*layer_sizes));
 	if (!layer_sizes) {
 		gguf_free(ctx);
 		return 0;
 	}
 
-	/* Identify per-layer tensor sizes */
 	for (i = 0; i < n_tensors; i++) {
 		const char *name = gguf_get_tensor_name(ctx, i);
 		const char *p;
@@ -141,10 +138,10 @@ auto_ngl(const char *path, int gpu, uint32_t n_ctx, uint32_t max_offload_bytes,
 		if (!name)
 			continue;
 
-        p = strstr(name, "blk.");
-        if (!p) p = strstr(name, "layers.");
-        if (!p) p = strstr(name, "block.");
-        if (!p)
+		p = strstr(name, "blk.");
+		if (!p) p = strstr(name, "layers.");
+		if (!p) p = strstr(name, "block.");
+		if (!p)
 			continue;
 
 		while (*p && !isdigit((unsigned char)*p))
@@ -161,75 +158,49 @@ auto_ngl(const char *path, int gpu, uint32_t n_ctx, uint32_t max_offload_bytes,
 
 	gguf_free(ctx);
 
-	/* workspace & kv calculations */
-
-	/* Largest single layer for scratch estimation */
 	largest_layer = 0;
 	for (i = 0; i < n_layers; i++)
 		if (layer_sizes[i] > largest_layer)
 			largest_layer = layer_sizes[i];
 
-	workspace_per_ctx = largest_layer * n_layers * 7 / 22;
+	workspace_per_ctx = largest_layer + (64 * 1024 * 1024);
 
-	/* KV per context (scaled by n_layers, with 1.25 overhead) */
+	/* 2 * n_ctx * n_embd * n_layers * sizeof(f16) == 4 * n_ctx * n_embd * n_layers */
 	kv_size_per_ctx =
-		(size_t)n_ctx *
-		(size_t)n_embd *
-		4ULL *
-		(size_t)n_layers;
+	    (size_t)n_ctx *
+	    (size_t)n_embd *
+	    25ULL *
+	    (size_t)n_layers;
 
-	kv_size_per_ctx += kv_size_per_ctx / 3; /* +33.3% */
+	system_overhead = kv_size_per_ctx / 10;
 
-	/* Cost of this context */
 	this_ctx_cost = kv_size_per_ctx + workspace_per_ctx;
 
-	/* Cost per additional context: add 1.5x spike margin */
-	per_other_ctx_cost = this_ctx_cost + (this_ctx_cost >> 1);
+	if (n_contexts > 1) {
+		per_other_ctx_cost = this_ctx_cost + (this_ctx_cost >> 1);
+		other_ctx_cost = per_other_ctx_cost * (size_t)(n_contexts - 1);
+	}
 
-	if (n_contexts > 1)
-		other_ctx_cost =
-			per_other_ctx_cost * (size_t)(n_contexts - 1);
-	else
-		other_ctx_cost = 0;
+	/* reserva fixa para driver/SO */
+	reserve = 128 * 1024 * 1024ULL;
 
-	/*   pure model-driven reserve (no vram factors) */
-	reserve  = (this_ctx_cost >> 1); /* 0.5 × this context */
-
-	if (n_contexts > 1)
-		reserve +=
-			(per_other_ctx_cost >> 1) *
-			(size_t)(n_contexts - 1); /* 0.5 × per-other */
-
-	reserve += largest_layer * 2; /* Extra load/attention slack */
-
-	/* Subtract model-driven reserve */
-	if (usable <= reserve) {
+	if (usable <= reserve + this_ctx_cost + other_ctx_cost + system_overhead) {
 		free(layer_sizes);
 		return 0;
 	}
 
 	usable -= reserve;
+	usable -= this_ctx_cost + other_ctx_cost + system_overhead;
 
-	/* subtract cost of contexts */
-	if (usable <= this_ctx_cost + other_ctx_cost) {
-		free(layer_sizes);
-		return 0;
-	}
-
-	usable -= this_ctx_cost + other_ctx_cost;
-
-	/* Apply max_offload_bytes AFTER reserve and context cost */
 	if (max_offload_bytes > 0 && usable > max_offload_bytes)
 		usable = max_offload_bytes;
 
-	/* greedy layer accumulation */
-
 	used = 0;
-	ngl  = 0;
+	ngl = 0;
 
 	for (i = 0; i < n_layers; i++) {
 		size_t weight = layer_sizes[i];
-		size_t need   = weight + (weight * 2 / 5); /* 1.4× overhead */
+		size_t need   = weight * 5 / 2;
 
 		if (used + need > usable)
 			break;
