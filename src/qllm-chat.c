@@ -6,7 +6,7 @@
 #include <netdb.h>
 
 #define PORT      4242
-#define END_TAG   "<|im"
+const char delimiter = 0x1f;
 
 int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused))) {
 	int sock;
@@ -76,7 +76,7 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 
 			response[cn] = '\0';
 
-			char *end = strstr(response, END_TAG);
+			char *end = strchr(response, delimiter);
 			if (end) {
 				*end = '\0';
 				printf("%s", response + first_skip);

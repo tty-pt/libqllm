@@ -105,6 +105,10 @@ qllm_next(struct qllm_context *ctx,
 	  char *out,
 	  size_t out_size);
 
+void
+qllm_position(struct qllm_context *ctx,
+	uint64_t pos);
+
 #ifdef __cplusplus
 }
 #endif

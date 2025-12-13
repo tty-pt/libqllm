@@ -1,4 +1,4 @@
-all := libqllm qllmd
+all := libqllm qllmd qllm-chat
 INSTALL_BIN := qllmd qllm-chat qllm-path qllm-list
 
 libqllm-obj-y-Linux := src/vulkan.o

@@ -16,19 +16,26 @@
 
 struct qllm_context;
 
+typedef struct {
+	unsigned *weights;
+	unsigned head;
+	unsigned tail;
+	unsigned sum;
+} token_queue_t;
+
 typedef struct fd_info {
 	char			line_buf[BUFSIZ * 4];
 	struct qllm_context *	ctx;
 	unsigned		end_pos;
 	unsigned		line_pos;
+	char			*ctx_buf;
+	size_t			ctx_buflen;
+	token_queue_t		queue;
 } fdi_t;
 
 fdi_t fdis[FD_SETSIZE], general;
 
-const char *start = "<|im_start|>";
-
-const char *end = "<|im_end|>";
-const unsigned end_len = 10;
+const char delimiter = 0x1f;
 
 size_t crb_len = 0;
 char *crb = NULL;
@@ -37,7 +44,7 @@ static char qllm_model_path[BUFSIZ];
 
 typedef struct gen_state {
 	int	fd;
-	fdi_t *fdi;
+	fdi_t	*fdi;
 	int	stop;
 } gen_state_t;
 
@@ -46,12 +53,16 @@ struct ndc_config ndc_config = {
 	.port = 4242,
 };
 
+struct qllm_config cfg = {
+	.model_path = qllm_model_path,
+	.n_ctx = 512,
+	.n_threads = 0,
 #if FEAT_GENERAL
-unsigned n_contexts = 2;
+	.n_contexts = 2,
 #else
-unsigned n_contexts = 1;
+	.n_contexts = 1,
 #endif
-unsigned n_ctx = 0;
+};
 
 static inline void
 append_to_line(fdi_t *fdi, const char *s, size_t len)
@@ -164,37 +175,42 @@ inference(int fd, fdi_t *fdi)
 	size_t	buflen;
 	char	*eoim;
 
-	/* Get next piece of text from qllm */
 	ret = qllm_next(fdi->ctx, buf, sizeof(buf));
 	if (ret < 0)
-		return 0;	/* error -> stop */
+		return 0; /* error -> stop */
 
 	if (ret == 0)
-		return 0;	/* EOS -> stop */
+		return 0; /* EOS -> stop */
+
+	fdi->queue.weights[fdi->queue.tail] = ret;
+	fdi->queue.tail++;
+	fdi->queue.sum += ret;
 
 	buflen = (size_t)ret;
+	strncpy(fdi->ctx_buf + fdi->ctx_buflen, buf, buflen);
+	fdi->ctx_buflen += buflen;
 
-	/* Mesma lógica de antes para detectar "<|im_end|>" */
-	eoim = strchr(buf, *(end + fdi->end_pos));
-	if (eoim && (eoim - buf) <= end_len - fdi->end_pos) {
-		size_t clen = buflen - (size_t)(eoim - buf);
+	eoim = memchr(buf, delimiter, buflen);
+	if (eoim) {
+		size_t n = (size_t)((char *)eoim - buf);
 
-		if (strncmp(eoim, end + fdi->end_pos, clen))
-			goto end;
+		if (n) {
+			ndc_write(fd, buf, n);
+			append_to_line(fdi, buf, n);
+		}
 
-		fdi->end_pos += clen;
-
-		if (fdi->end_pos < end_len)
-			return 1;
-
-		fdi->end_pos = 0;
 		return 0;
 	}
 
-end:
 	if (fdi->end_pos) {
-		ndc_write(fd, (void *)end, fdi->end_pos);
-		append_to_line(fdi, end, fdi->end_pos);
+		char buf2[32];
+		ssize_t len;
+
+		len = snprintf(buf2, sizeof(buf2),
+				"%c", delimiter);
+
+		ndc_write(fd, buf2, len);
+		append_to_line(fdi, buf2, len);
 		fdi->end_pos = 0;
 	}
 
@@ -204,6 +220,24 @@ end:
 	if (strrchr(buf, '\n')) {
 		cmd_exec(fd, fdi);
 		fdi->line_pos = 0;
+	}
+
+	if (fdi->queue.tail > (unsigned) cfg.n_ctx * 3 / 4) {
+		size_t pointer = 0;
+		while (fdi->queue.head < (unsigned) cfg.n_ctx / 2) {
+			pointer += fdi->queue.weights[
+				fdi->queue.head
+			];
+			fdi->queue.head ++;
+		}
+
+		fprintf(stderr, "SLIDE! '%s' '%lu' %lu\n", fdi->ctx_buf, pointer, fdi->ctx_buflen);
+		memmove(fdi->ctx_buf, fdi->ctx_buf + pointer, fdi->ctx_buflen - pointer);
+		fdi->ctx_buflen -= pointer;
+		memmove(fdi->queue.weights, fdi->queue.weights + fdi->queue.head, fdi->queue.tail - fdi->queue.head);
+		fdi->queue.tail -= fdi->queue.head;
+		qllm_position(fdi->ctx, fdi->queue.head);
+		fdi->queue.head = 0;
 	}
 
 	return 1;
@@ -241,7 +275,7 @@ do_ASK(int fd, int argc, char *argv[])
 	char buf[BUFSIZ * 2], *b = buf;
 	int i, ret;
 
-	b += snprintf(b, sizeof(buf) - (b - buf), "%suser\n", start);
+	b += snprintf(b, sizeof(buf) - (b - buf), "user\n");
 	for (i = 1; i < argc; i++) {
 		ret = snprintf(b, sizeof(buf) - (b - buf), " %s", argv[i]);
 		if (ret < 0 || (size_t)ret >= sizeof(buf) - (size_t)(b - buf)) {
@@ -250,28 +284,25 @@ do_ASK(int fd, int argc, char *argv[])
 		}
 		b += ret;
 	}
-	b += snprintf(b, sizeof(buf) - (b - buf), "%s\n%sassistant\n ", end, start);
+	b += snprintf(b, sizeof(buf) - (b - buf), "%cassistant\n", delimiter);
 
 	generate(fd, buf);
-	ndc_writef(fd, "%s\n", end);
+	ndc_writef(fd, "%c\n", delimiter);
 }
 
 static inline void
 fdi_init(fdi_t *fdi)
 {
-	struct qllm_config cfg = {
-		.model_path = qllm_model_path,
-		.n_ctx = n_ctx,
-		.n_threads = 0,
-		.n_contexts = n_contexts,
-	};
-
 	if (fdi->ctx && fdi->ctx != general.ctx)
 		qllm_free(fdi->ctx);
 
 	fprintf(stderr, "N_CONTEXTS! %d\n", cfg.n_contexts);
+	fdi->queue.weights = calloc(cfg.n_ctx, sizeof(unsigned));
+	fdi->queue.sum = fdi->queue.tail = fdi->queue.head = 0;
 	fdi->ctx = qllm_create(&cfg);
-	/* fdi->ctx = general.ctx; */
+	fdi->ctx_buf = malloc(10 * cfg.n_ctx);
+	memset(fdi->ctx_buf, 0, 10 * cfg.n_ctx);
+	fdi->ctx_buflen = 0;
 	if (!fdi->ctx)
 		qsyslog(QLOG_ERR, "Failed to init qllm context\n");
 
@@ -342,13 +373,6 @@ static void
 setup(const char *model_path)
 {
 #if FEAT_GENERAL
-	struct qllm_config cfg = {
-		.model_path = model_path,
-		.n_ctx = n_ctx,
-		.n_threads = 0,
-		.n_contexts = n_contexts,
-	};
-
 	general.ctx = qllm_create(&cfg);
 	CBUG(!general.ctx,
 			"Failed to create qllm context\n");
@@ -403,11 +427,11 @@ main(int argc, char *argv[])
 			break;
 
 		case 'n':
-			n_contexts = atoi(optarg);
+			cfg.n_contexts = atoi(optarg);
 			break;
 
 		case 'c':
-			n_ctx = atoi(optarg);
+			cfg.n_ctx = atoi(optarg);
 			break;
 
 		default:

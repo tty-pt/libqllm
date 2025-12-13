@@ -259,6 +259,31 @@ struct llama_model *model_load(
 	return model;
 }
 
+void
+qllm_position(struct qllm_context *ctx,
+	uint64_t pos)
+{
+	llama_pos pos_min, pos_max;
+	llama_memory_t mem;
+
+	mem = llama_get_memory(ctx->ctx);
+
+	pos_min = llama_memory_seq_pos_min(mem, 0);
+	pos_max = llama_memory_seq_pos_max(mem, 0);
+
+	if (pos_min < 0 || pos_max < 0) {
+		ctx->cur_pos = 0;
+		return;
+	}
+
+	/* remove tokens antes de new_pos */
+	llama_memory_seq_rm(mem, 0, pos_min, pos);
+
+	/* desloca os restantes para começar em 0 */
+	llama_memory_seq_add(mem, 0, pos, -1, -pos);
+	ctx->cur_pos = pos_max - pos + 1;
+}
+
 struct qllm_context *
 qllm_create(const struct qllm_config *cfg)
 {
