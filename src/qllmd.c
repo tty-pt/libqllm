@@ -17,25 +17,19 @@
 struct qllm_context;
 
 typedef struct {
-	unsigned *weights;
-	unsigned head;
 	unsigned tail;
-	unsigned sum;
 } token_queue_t;
 
 typedef struct fd_info {
 	char			line_buf[BUFSIZ * 4];
 	struct qllm_context *	ctx;
-	unsigned		end_pos;
 	unsigned		line_pos;
-	char			*ctx_buf;
-	size_t			ctx_buflen;
 	token_queue_t		queue;
 } fdi_t;
 
 fdi_t fdis[FD_SETSIZE], general;
 
-const char delimiter = 0x1f;
+const char delimiter = 4;
 
 size_t crb_len = 0;
 char *crb = NULL;
@@ -88,7 +82,6 @@ static inline void
 reset_fdi(fdi_t *fdi)
 {
 	fdi->line_pos = 0;
-	fdi->end_pos = 0;
 	memset(fdi->line_buf, 0, sizeof(fdi->line_buf));
 }
 
@@ -182,13 +175,9 @@ inference(int fd, fdi_t *fdi)
 	if (ret == 0)
 		return 0; /* EOS -> stop */
 
-	fdi->queue.weights[fdi->queue.tail] = ret;
 	fdi->queue.tail++;
-	fdi->queue.sum += ret;
 
 	buflen = (size_t)ret;
-	strncpy(fdi->ctx_buf + fdi->ctx_buflen, buf, buflen);
-	fdi->ctx_buflen += buflen;
 
 	eoim = memchr(buf, delimiter, buflen);
 	if (eoim) {
@@ -202,18 +191,6 @@ inference(int fd, fdi_t *fdi)
 		return 0;
 	}
 
-	if (fdi->end_pos) {
-		char buf2[32];
-		ssize_t len;
-
-		len = snprintf(buf2, sizeof(buf2),
-				"%c", delimiter);
-
-		ndc_write(fd, buf2, len);
-		append_to_line(fdi, buf2, len);
-		fdi->end_pos = 0;
-	}
-
 	ndc_write(fd, buf, buflen);
 	append_to_line(fdi, buf, buflen);
 
@@ -222,23 +199,7 @@ inference(int fd, fdi_t *fdi)
 		fdi->line_pos = 0;
 	}
 
-	if (fdi->queue.tail > (unsigned) cfg.n_ctx * 3 / 4) {
-		size_t pointer = 0;
-		while (fdi->queue.head < (unsigned) cfg.n_ctx / 2) {
-			pointer += fdi->queue.weights[
-				fdi->queue.head
-			];
-			fdi->queue.head ++;
-		}
-
-		fprintf(stderr, "SLIDE! '%s' '%lu' %lu\n", fdi->ctx_buf, pointer, fdi->ctx_buflen);
-		memmove(fdi->ctx_buf, fdi->ctx_buf + pointer, fdi->ctx_buflen - pointer);
-		fdi->ctx_buflen -= pointer;
-		memmove(fdi->queue.weights, fdi->queue.weights + fdi->queue.head, fdi->queue.tail - fdi->queue.head);
-		fdi->queue.tail -= fdi->queue.head;
-		qllm_position(fdi->ctx, fdi->queue.head);
-		fdi->queue.head = 0;
-	}
+	qllm_compress(fdi->ctx, cfg.n_ctx * 4 / 5);
 
 	return 1;
 }
@@ -250,14 +211,15 @@ generate(int fd, const char *prompt)
 	int	 step;
 	int	 max_gen = MAX_MEMORY;
 
+	qllm_anchor_start(fdi->ctx);
 	/* Prime qllm context with the full prompt */
 	if (qllm_prime(fdi->ctx, prompt) < 0) {
 		qsyslog(QLOG_ERR, "qllm_prime failed\n");
 		return;
 	}
+	qllm_anchor_end(fdi->ctx);
 
 	fdi->line_pos = 0;
-	fdi->end_pos = 0;
 
 	for (step = 0;
 	     step < max_gen && inference(fd, fdi);
@@ -275,7 +237,7 @@ do_ASK(int fd, int argc, char *argv[])
 	char buf[BUFSIZ * 2], *b = buf;
 	int i, ret;
 
-	b += snprintf(b, sizeof(buf) - (b - buf), "user\n");
+	b += snprintf(b, sizeof(buf) - (b - buf), "%c\nuser:\n", delimiter);
 	for (i = 1; i < argc; i++) {
 		ret = snprintf(b, sizeof(buf) - (b - buf), " %s", argv[i]);
 		if (ret < 0 || (size_t)ret >= sizeof(buf) - (size_t)(b - buf)) {
@@ -284,7 +246,7 @@ do_ASK(int fd, int argc, char *argv[])
 		}
 		b += ret;
 	}
-	b += snprintf(b, sizeof(buf) - (b - buf), "%cassistant\n", delimiter);
+	b += snprintf(b, sizeof(buf) - (b - buf), "%c\nassistant:\n", delimiter);
 
 	generate(fd, buf);
 	ndc_writef(fd, "%c\n", delimiter);
@@ -297,12 +259,9 @@ fdi_init(fdi_t *fdi)
 		qllm_free(fdi->ctx);
 
 	fprintf(stderr, "N_CONTEXTS! %d\n", cfg.n_contexts);
-	fdi->queue.weights = calloc(cfg.n_ctx, sizeof(unsigned));
-	fdi->queue.sum = fdi->queue.tail = fdi->queue.head = 0;
+	fdi->queue.tail = 0;
 	fdi->ctx = qllm_create(&cfg);
-	fdi->ctx_buf = malloc(10 * cfg.n_ctx);
-	memset(fdi->ctx_buf, 0, 10 * cfg.n_ctx);
-	fdi->ctx_buflen = 0;
+
 	if (!fdi->ctx)
 		qsyslog(QLOG_ERR, "Failed to init qllm context\n");
 

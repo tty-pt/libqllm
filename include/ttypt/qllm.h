@@ -106,8 +106,10 @@ qllm_next(struct qllm_context *ctx,
 	  size_t out_size);
 
 void
-qllm_position(struct qllm_context *ctx,
-	uint64_t pos);
+qllm_compress(struct qllm_context *ctx, uint32_t limit);
+
+void qllm_anchor_start(struct qllm_context *ctx);
+void qllm_anchor_end(struct qllm_context *ctx);
 
 #ifdef __cplusplus
 }

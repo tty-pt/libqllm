@@ -25,7 +25,7 @@ struct qllm_context {
 
 	int32_t			 n_embd;
 	int32_t			 max_tokens;
-	llama_pos		 cur_pos;
+	llama_pos		 anchor_start, anchor_end;
 
 	llama_token		*token_buf;
 	llama_seq_id		*seq_ids;
@@ -51,6 +51,7 @@ qllm_decode_tokens(struct qllm_context *qctx,
 		   int32_t n_tokens)
 {
 	struct llama_batch batch;
+	static llama_seq_id seq0 = 0;
 	int32_t i;
 
 	if (!qctx || !qctx->ctx || !tokens || n_tokens <= 0)
@@ -61,20 +62,19 @@ qllm_decode_tokens(struct qllm_context *qctx,
 
 	batch = llama_batch_init(n_tokens, 0, 1);
 	batch.n_tokens = n_tokens;
+	batch.pos = NULL;
 
 	for (i = 0; i < n_tokens; ++i) {
 		batch.token[i] = tokens[i];
-		batch.pos[i] = qctx->cur_pos + i;
 		batch.n_seq_id[i] = 1;
-		qctx->seq_ids[i] = 0;
-		batch.seq_id[i] = &qctx->seq_ids[i];
+		/* qctx->seq_ids[i] = 0; */
+		batch.seq_id[i] = &seq0;
 		batch.logits[i] = (i == n_tokens - 1);
 	}
 
 	if (llama_decode(qctx->ctx, batch) != 0)
 		return -1;
 
-	qctx->cur_pos += n_tokens;
 	return 0;
 }
 
@@ -260,28 +260,70 @@ struct llama_model *model_load(
 }
 
 void
-qllm_position(struct qllm_context *ctx,
-	uint64_t pos)
+qllm_anchor_start(struct qllm_context *ctx) {
+	llama_memory_t	mem = llama_get_memory(ctx->ctx);
+	ctx->anchor_start = ctx->anchor_end
+		= llama_memory_seq_pos_max(mem, 0);
+}
+
+void
+qllm_anchor_end(struct qllm_context *ctx) {
+	llama_memory_t	mem = llama_get_memory(ctx->ctx);
+	ctx->anchor_end = llama_memory_seq_pos_max(mem, 0);
+}
+
+void
+qllm_compress(struct qllm_context *ctx, uint32_t limit)
 {
-	llama_pos pos_min, pos_max;
-	llama_memory_t mem;
+	struct llama_context *lctx = ctx->ctx;
+	llama_memory_t mem = llama_get_memory(lctx);
 
-	mem = llama_get_memory(ctx->ctx);
+	const uint32_t anchor_guard = 16; /* margem pós-anchor */
 
-	pos_min = llama_memory_seq_pos_min(mem, 0);
-	pos_max = llama_memory_seq_pos_max(mem, 0);
-
-	if (pos_min < 0 || pos_max < 0) {
-		ctx->cur_pos = 0;
+	int32_t total_tokens = llama_memory_seq_pos_max(mem, 0) + 1;
+	if (total_tokens <= (int32_t)limit)
 		return;
+
+	uint32_t to_drop = total_tokens - limit;
+
+	/* 1. DROP BEFORE ANCHOR (prefix) */
+	if (ctx->anchor_start > 0 && to_drop > 0) {
+		uint32_t prefix_avail = ctx->anchor_start;
+		uint32_t drop_prefix = to_drop > prefix_avail ? prefix_avail : to_drop;
+
+		llama_memory_seq_rm(mem, 0, 0, drop_prefix);
+		llama_memory_seq_add(mem, 0, drop_prefix, total_tokens,
+				     -(int32_t)drop_prefix);
+
+		ctx->anchor_start -= drop_prefix;
+		ctx->anchor_end   -= drop_prefix;
+
+		to_drop      -= drop_prefix;
+		total_tokens -= drop_prefix;
 	}
 
-	/* remove tokens antes de new_pos */
-	llama_memory_seq_rm(mem, 0, pos_min, pos);
+	/* 2. DROP AFTER ANCHOR + GUARD */
+	if (to_drop > 0) {
+		uint32_t drop_start = ctx->anchor_end + anchor_guard;
 
-	/* desloca os restantes para começar em 0 */
-	llama_memory_seq_add(mem, 0, pos, -1, -pos);
-	ctx->cur_pos = pos_max - pos + 1;
+		/* Se não houver espaço para a margem, começa no anchor_end */
+		if (drop_start > (uint32_t)total_tokens)
+			drop_start = ctx->anchor_end;
+
+		uint32_t max_drop = total_tokens - drop_start;
+		if (to_drop > max_drop)
+			to_drop = max_drop;
+
+		if (to_drop > 0) {
+			llama_memory_seq_rm(mem, 0,
+					    drop_start,
+					    drop_start + to_drop);
+			llama_memory_seq_add(mem, 0,
+					     drop_start + to_drop,
+					     total_tokens,
+					     -(int32_t)to_drop);
+		}
+	}
 }
 
 struct qllm_context *
@@ -350,6 +392,14 @@ qllm_create(const struct qllm_config *cfg)
 		goto fail;
 
 	llama_sampler_chain_add(qctx->sampler,
+		llama_sampler_init_penalties(
+			64,    // last_n
+			1.1f,  // repeat
+			0.0f,  // freq
+			0.0f   // present
+		));
+
+	llama_sampler_chain_add(qctx->sampler,
 	    llama_sampler_init_greedy());
 
 	qctx->token_buf = calloc((size_t)qctx->max_tokens,
@@ -358,8 +408,6 @@ qllm_create(const struct qllm_config *cfg)
 	    sizeof(*qctx->seq_ids));
 	if (!qctx->token_buf || !qctx->seq_ids)
 		goto fail;
-
-	qctx->cur_pos = 0;
 
 	return qctx;
 
@@ -407,8 +455,6 @@ qllm_generate_stream_internal(struct qllm_context *qctx,
 	llama_free(qctx->ctx);
 	qctx->ctx = llama_init_from_model(qctx->model, qctx->params);
 
-	qctx->cur_pos = 0;
-
 	n_prompt = llama_tokenize(qctx->vocab,
 				  prompt,
 				  (int32_t) strlen(prompt),
@@ -428,6 +474,9 @@ qllm_generate_stream_internal(struct qllm_context *qctx,
 	for (step = 0; step < max_gen; ++step) {
 		tok = llama_sampler_sample(qctx->sampler, qctx->ctx, -1);
 		llama_sampler_accept(qctx->sampler, tok);
+
+		if (tok == llama_vocab_eot(qctx->vocab))
+			break;
 
 		if (llama_vocab_is_eog(qctx->vocab, tok))
 			break;
@@ -545,8 +594,6 @@ qllm_embed(struct qllm_context *qctx,
 
 	llama_free(qctx->ctx);
 	qctx->ctx = llama_init_from_model(qctx->model, qctx->params);
-	qctx->cur_pos = 0;
-
 	n_tokens = llama_tokenize(qctx->vocab,
 				  text,
 				  (int32_t) strlen(text),
@@ -596,12 +643,12 @@ qllm_prime(struct qllm_context *qctx,
 		return -1;
 
 	if (n_prompt == 0)
-		return 0;
+		return n_prompt;
 
 	if (qllm_decode_tokens(qctx, qctx->token_buf, n_prompt) != 0)
 		return -1;
 
-	return 0;
+	return n_prompt;
 }
 
 int
@@ -619,6 +666,20 @@ qllm_next(struct qllm_context *qctx,
 	/* Sample one token */
 	tok = llama_sampler_sample(qctx->sampler, qctx->ctx, -1);
 	llama_sampler_accept(qctx->sampler, tok);
+
+	if (tok == llama_vocab_eot(qctx->vocab)) {
+		qctx->token_buf[0] = tok;
+		qllm_decode_tokens(qctx, qctx->token_buf, 1);
+		return 0;
+	}
+
+
+	/* Control token genérico */
+	if (llama_vocab_is_control(qctx->vocab, tok)) {
+		qctx->token_buf[0] = tok;
+		qllm_decode_tokens(qctx, qctx->token_buf, 1);
+		return 1; // continua, mas nada foi escrito
+	}
 
 	/* Treat any EOG/EOS as end-of-generation */
 	if (llama_vocab_is_eog(qctx->vocab, tok))

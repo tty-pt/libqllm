@@ -6,7 +6,7 @@
 #include <netdb.h>
 
 #define PORT      4242
-const char delimiter = 0x1f;
+const char delimiter = 4;
 
 int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused))) {
 	int sock;
