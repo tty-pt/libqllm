@@ -110,6 +110,9 @@ qllm_compress(struct qllm_context *ctx, uint32_t limit);
 
 void qllm_anchor_start(struct qllm_context *ctx);
 void qllm_anchor_end(struct qllm_context *ctx);
+void qllm_set_eos_bias(struct qllm_context *qctx,
+		  int32_t start_tokens,
+		  float max_bias);
 
 #ifdef __cplusplus
 }

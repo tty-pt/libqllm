@@ -29,6 +29,15 @@ struct qllm_context {
 
 	llama_token		*token_buf;
 	llama_seq_id		*seq_ids;
+
+	
+	int32_t gen_tokens;
+	int32_t eos_start;
+	float   eos_bias_max;
+};
+
+struct eos_bias_sampler_ctx {
+	struct qllm_context * qctx;
 };
 
 static int qllm_backend_inited;
@@ -326,6 +335,88 @@ qllm_compress(struct qllm_context *ctx, uint32_t limit)
 	}
 }
 
+static void
+eos_bias_apply(struct llama_sampler * smpl,
+	       struct llama_token_data_array * cur_p)
+{
+	struct eos_bias_sampler_ctx * sctx =
+		(struct eos_bias_sampler_ctx *) smpl->ctx;
+	struct qllm_context * qctx = sctx->qctx;
+
+	if (qctx->gen_tokens < qctx->eos_start)
+		return;
+
+	const llama_token eos = llama_vocab_eot(qctx->vocab);
+
+	float t = (float)(qctx->gen_tokens - qctx->eos_start) / 16.0f;
+	if (t < 0.0f) return;
+
+	if (t > 1.0f)
+		t = 1.0f;
+
+	/* Exponential ramp */
+	float bias = qctx->eos_bias_max * (t * t * t);
+
+	for (size_t i = 0; i < cur_p->size; ++i) {
+		if (cur_p->data[i].id == eos) {
+			cur_p->data[i].logit += bias;
+			return;
+		}
+	}
+}
+
+static void
+eos_bias_accept(struct llama_sampler * smpl, llama_token token)
+{
+	(void) smpl;
+	(void) token;
+}
+
+static void
+eos_bias_reset(struct llama_sampler * smpl)
+{
+	(void) smpl;
+}
+
+static struct llama_sampler *
+eos_bias_clone(const struct llama_sampler * smpl)
+{
+	const struct eos_bias_sampler_ctx * old =
+		(const struct eos_bias_sampler_ctx *) smpl->ctx;
+
+	struct eos_bias_sampler_ctx * ctx =
+		malloc(sizeof(*ctx));
+	*ctx = *old;
+
+	return llama_sampler_init(smpl->iface, ctx);
+}
+
+static void
+eos_bias_free(struct llama_sampler * smpl)
+{
+	free(smpl->ctx);
+}
+
+static const struct llama_sampler_i eos_bias_iface = {
+	.name   = NULL,
+	.accept = eos_bias_accept,
+	.apply  = eos_bias_apply,
+	.reset  = eos_bias_reset,
+	.clone  = eos_bias_clone,
+	.free   = eos_bias_free,
+};
+
+static struct llama_sampler *
+llama_sampler_init_eos_bias(struct qllm_context * qctx)
+{
+	struct eos_bias_sampler_ctx * ctx =
+		malloc(sizeof(*ctx));
+
+	ctx->qctx = qctx;
+
+	return llama_sampler_init(&eos_bias_iface, ctx);
+}
+
 struct qllm_context *
 qllm_create(const struct qllm_config *cfg)
 {
@@ -392,6 +483,9 @@ qllm_create(const struct qllm_config *cfg)
 		goto fail;
 
 	llama_sampler_chain_add(qctx->sampler,
+		llama_sampler_init_eos_bias(qctx));
+
+	llama_sampler_chain_add(qctx->sampler,
 		llama_sampler_init_penalties(
 			64,    // last_n
 			1.1f,  // repeat
@@ -400,7 +494,7 @@ qllm_create(const struct qllm_config *cfg)
 		));
 
 	llama_sampler_chain_add(qctx->sampler,
-	    llama_sampler_init_greedy());
+		llama_sampler_init_dist(0));
 
 	qctx->token_buf = calloc((size_t)qctx->max_tokens,
 	    sizeof(*qctx->token_buf));
@@ -408,6 +502,10 @@ qllm_create(const struct qllm_config *cfg)
 	    sizeof(*qctx->seq_ids));
 	if (!qctx->token_buf || !qctx->seq_ids)
 		goto fail;
+
+	qctx->gen_tokens   = 0;
+	qctx->eos_start    = 64;
+	qctx->eos_bias_max = 3.0f;
 
 	return qctx;
 
@@ -478,6 +576,9 @@ qllm_generate_stream_internal(struct qllm_context *qctx,
 		if (tok == llama_vocab_eot(qctx->vocab))
 			break;
 
+		if (tok == llama_vocab_eos(qctx->vocab))
+			break;
+
 		if (llama_vocab_is_eog(qctx->vocab, tok))
 			break;
 
@@ -494,6 +595,8 @@ qllm_generate_stream_internal(struct qllm_context *qctx,
 					       true);
 		if (n_piece <= 0)
 			continue;
+
+		qctx->gen_tokens++;
 
 		cb(user, piece, (size_t) n_piece);
 	}
@@ -632,6 +735,8 @@ qllm_prime(struct qllm_context *qctx,
 	if (!qctx || !qctx->ctx || !prompt)
 		return -1;
 
+	qctx->gen_tokens = 0;
+
 	n_prompt = llama_tokenize(qctx->vocab,
 				  prompt,
 				  (int32_t)strlen(prompt),
@@ -673,6 +778,11 @@ qllm_next(struct qllm_context *qctx,
 		return 0;
 	}
 
+	if (tok == llama_vocab_eos(qctx->vocab)) {
+		qctx->token_buf[0] = tok;
+		qllm_decode_tokens(qctx, qctx->token_buf, 1);
+		return 0;
+	}
 
 	/* Control token genérico */
 	if (llama_vocab_is_control(qctx->vocab, tok)) {
@@ -706,6 +816,19 @@ qllm_next(struct qllm_context *qctx,
 
 	memcpy(out, piece, (size_t)n_piece);
 	out[n_piece] = '\0';
+	qctx->gen_tokens ++;
 
 	return n_piece;
+}
+
+void
+qllm_set_eos_bias(struct qllm_context *qctx,
+		  int32_t start_tokens,
+		  float max_bias)
+{
+	if (!qctx)
+		return;
+
+	qctx->eos_start    = start_tokens;
+	qctx->eos_bias_max = max_bias;
 }
