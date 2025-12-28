@@ -12,10 +12,12 @@ jobs:
       name: libqllm
       deps: "libqsys,libqmap,libndc,libvulkan-dev,vulkan-tools,glslang-tools,cmake,wget"
       deps_pacman: "libqsys,libqmap,libndc,vulkan-headers,vulkan-icd-loader,vulkan-tools,glslang,cmake,wget"
+      deps_pacman_mingw: "mingw-w64-libqsys,mingw-w64-libqmap,mingw-w64-libndc"
+      deps_aur_mingw: "mingw-w64-vulkan-headers,mingw-w64-vulkan-icd-loader,mingw-w64-vulkan-tools,mingw-w64-glslang,mingw-w64-cmake,wget"
       deps_apk: "libqsys,libqmap,libndc,vulkan-loader,vulkan-loader-dev,vulkan-headers,vulkan-tools,cmake,xz,wget"
       deps_rpm: "libqsys,libqmap,libndc,vulkan-headers,vulkan-loader,vulkan-loader-devel,vulkan-tools,glslang,cmake,wget,g++"
       deps_brew: "libqsys,libqmap,libndc,cmake,libomp"
-      publish_to: "deb,pacman,rpm,brew"
+      publish_to: "deb,pacman,rpm,brew,pacman_mingw"
     secrets:
       HOST: ${{ secrets.OPENBSD_HOST }}
       USER: ${{ secrets.OPENBSD_USER }}
