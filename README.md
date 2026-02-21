@@ -20,3 +20,34 @@ Run:
 qllmd -d -p 4242 gemma* # To start the service
 qllm-chat # To talk to it
 ```
+
+## opencode integration
+
+`qllmd` also exposes an [OpenAI-compatible](https://platform.openai.com/docs/api-reference/chat) HTTP API on the same port, so it works out of the box as a provider for [opencode](https://opencode.ai).
+
+Start the daemon as usual:
+```sh
+qllmd -d -p 4242 gemma*
+```
+
+Add a custom provider in `~/.config/opencode/config.json`:
+```json
+{
+  "provider": {
+    "local": {
+      "name": "Local (qllm)",
+      "api": "http://localhost:4242",
+      "npm": "@ai-sdk/openai-compatible"
+    }
+  }
+}
+```
+
+List available models to confirm connectivity:
+```sh
+curl http://localhost:4242/v1/models
+```
+
+Then select the model in opencode using `local/<model-id>` (where `<model-id>` is the
+filename without the `.gguf` extension, e.g. `local/gemma-3-finetune.Q8_0`).
+
