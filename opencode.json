@@ -1,0 +1,22 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "libqllm": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "libqllm (local)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8001/v1",
+        "apiKey": "dummy"
+      },
+      "models": {
+        "phi-3": {
+          "name": "Phi-3-mini-4k-instruct (local)",
+          "limit": {
+            "context": 4096,
+            "output": 2048
+          }
+        }
+      }
+    }
+  }
+}

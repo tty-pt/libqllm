@@ -25,7 +25,7 @@ omp := ${prefix-Darwin}/Cellar/libomp/
 omp-version := $(shell ls ${omp} | head -n 1)
 omp := ${omp}/${omp-version}
 
-CFLAGS := -g -I${llamacpp}/../include -I${llamacpp}/../ggml/include -I${vulkan}/include
+CFLAGS := -g -I${llamacpp}/../include -I${llamacpp}/../ggml/include -I${vulkan}/include -Ithird_party/cjson
 CFLAGS-Darwin := -I${omp}/include
 
 ggmlp := ${llamacpp}/ggml/src
@@ -35,6 +35,7 @@ LDFLAGS-Linux := -L${ggmlp}/ggml-vulkan
 LDFLAGS-Darwin := -L${ggmlp}/ggml-metal -L${ggmlp}/ggml-blas -L${omp}/lib
 
 LDLIBS-qllmd := -lqsys -lndc -lqllm
+qllmd-obj-y := third_party/cjson/cJSON.o
 
 LDLIBS-libqllm := -lllama -lggml -lggml-cpu -lggml-base -lqmap -ldl -lpthread -lm -lstdc++
 LDLIBS-libqllm-Linux := -lgomp -lvulkan -lggml-vulkan
@@ -56,6 +57,14 @@ install-dirs := ${completions}
 install-extra := ${completions}/qllmd
 
 include ./../mk/include.mk
+
+# cJSON dependency for qllmd
+third_party/cjson/cJSON.o: third_party/cjson/cJSON.c third_party/cjson/cJSON.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+src/qllmd.o: third_party/cjson/cJSON.h
+
+qllmd: third_party/cjson/cJSON.o
 
 src/libqllm.o: $(llamacpp)/src/libllama.a
 

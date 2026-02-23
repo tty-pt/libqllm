@@ -21,6 +21,16 @@ struct qllm_config {
 	int32_t       n_threads;  /* Number of CPU threads (default: half of CPUs) */
 	uint32_t      max_offload_bytes; /* Max byte offload */
 	int32_t      n_contexts; /* How many contexts to account for */
+	
+	/* Sampling parameters (added for better generation control) */
+	float         temperature;    /* Temperature (default 0.7, 0.0 = greedy) */
+	int32_t       top_k;         /* Top-K sampling (default 40, 0 = disabled) */
+	float         top_p;         /* Top-P/nucleus sampling (default 0.95, 1.0 = disabled) */
+	float         repeat_penalty; /* Repeat penalty (default 1.1, 1.0 = disabled) */
+	int32_t       repeat_last_n; /* Tokens to consider for repeat penalty (default 64) */
+	
+	/* Feature flags */
+	int           enable_embeddings; /* Enable embeddings mode (needed for qllm_embed(), default 0) */
 };
 
 /*

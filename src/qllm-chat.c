@@ -66,7 +66,6 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 			break;
 		}
 
-		int first_skip = 1;
 		while (1) {
 			ssize_t cn = read(sock, response,
 					sizeof(response) - 1);
@@ -75,6 +74,8 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 				break;
 
 			response[cn] = '\0';
+
+			int first_skip = (*response == delimiter);
 
 			char *end = strchr(response, delimiter);
 			if (end) {
