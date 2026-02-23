@@ -1,0 +1,634 @@
+#!/usr/bin/env python3
+"""
+qllm-serve: OpenAI-compatible API server for libqllm
+Wraps qllmd daemon to provide OpenAI-compatible /v1/chat/completions endpoint
+"""
+
+import socket
+import json
+import time
+import logging
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+from urllib.parse import urlparse
+import argparse
+
+# Threading HTTPServer for better concurrent handling
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """Handle requests in separate threads"""
+    daemon_threads = True
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+QLLMD_HOST = '127.0.0.1'
+QLLMD_PORT = 4242
+MODEL_INFO = None  # Will be populated on startup
+
+def get_model_info():
+    """Query qllmd for loaded model information"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5)
+        sock.connect((QLLMD_HOST, QLLMD_PORT))
+        
+        sock.sendall(b'info\n')
+        response = sock.recv(4096)
+        sock.close()
+        
+        return json.loads(response.decode('utf-8'))
+    except Exception as e:
+        logger.warning(f"Could not get model info from qllmd: {e}")
+        return None
+
+def initialize_model_info():
+    """Initialize model info from qllmd on startup"""
+    global MODEL_INFO
+    MODEL_INFO = get_model_info()
+    if MODEL_INFO:
+        logger.info(f"Detected model: {MODEL_INFO['model']} (template: {MODEL_INFO['template']})")
+    else:
+        logger.warning("Could not detect model info from qllmd")
+        MODEL_INFO = {"model": "unknown", "template": "generic"}
+
+class QLLMHandler(BaseHTTPRequestHandler):
+    """Handler for OpenAI-compatible API requests"""
+    
+    def do_GET(self):
+        """Handle GET requests"""
+        path = urlparse(self.path).path
+        
+        if path == '/v1/models':
+            self.handle_list_models()
+        elif path in ['/health', '/v1/health']:
+            self.handle_health()
+        else:
+            self.send_error(404, "Endpoint not found")
+    
+    def do_POST(self):
+        """Handle POST requests"""
+        path = urlparse(self.path).path
+        
+        # Log all incoming requests
+        headers = {k: v for k, v in self.headers.items()}
+        logger.info(f"POST request to {path}")
+        logger.info(f"Headers: {headers}")
+        
+        if path == '/v1/chat/completions':
+            self.handle_chat_completions()
+        elif path == '/v1/completions':
+            self.handle_completions()
+        else:
+            logger.warning(f"Unknown endpoint: {path}")
+            self.send_error(404, "Endpoint not found")
+    
+    def handle_list_models(self):
+        """List available models (OpenAI compatible)"""
+        model_id = MODEL_INFO['model'].replace('.gguf', '').replace('.GGUF', '')
+        
+        response = {
+            "object": "list",
+            "data": [
+                {
+                    "id": model_id,
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "local",
+                    "permission": [],
+                    "root": model_id,
+                    "parent": None
+                }
+            ]
+        }
+        
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(response).encode())
+    
+    def handle_health(self):
+        """Health check endpoint"""
+        # Try to ping qllmd to verify it's responsive
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            sock.connect((QLLMD_HOST, QLLMD_PORT))
+            sock.close()
+            status = "ok"
+            status_code = 200
+        except Exception as e:
+            status = "qllmd_unreachable"
+            status_code = 503
+            logger.error(f"Health check failed: {e}")
+        
+        response = {
+            "status": status,
+            "model": MODEL_INFO['model'] if MODEL_INFO else "unknown"
+        }
+        
+        self.send_response(status_code)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(response).encode())
+    
+    def _truncate_messages(self, messages, max_system_length=4096):
+        """Truncate system messages to fit within context limits
+        
+        OpenCode sends very large system prompts (~46KB) which exceed
+        the model's context window. This truncates the system prompt
+        to a reasonable size while keeping the user message intact.
+        """
+        truncated = []
+        for msg in messages:
+            role = msg.get('role', '')
+            content = msg.get('content', '')
+            
+            if role == 'system' and len(content) > max_system_length:
+                # Truncate system message - keep only the beginning
+                truncated_content = content[:max_system_length] + "\n\n[System prompt truncated due to length - visit https://opencode.ai for help]"
+                truncated.append({"role": role, "content": truncated_content})
+                logger.warning(f"System prompt truncated from {len(content)} to {max_system_length} chars")
+            else:
+                truncated.append(msg)
+        
+        return truncated
+    
+    def handle_chat_completions(self):
+        """Handle /v1/chat/completions endpoint"""
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            logger.info(f"Request body: {body[:500]}")  # Log first 500 chars
+            data = json.loads(body)
+            
+            # Extract parameters
+            messages = data.get('messages', [])
+            model = data.get('model', 'phi-3-mini')
+            stream = data.get('stream', False)
+            tools = data.get('tools', [])  # Extract tools
+            
+            logger.info(f"model={model}, stream={stream}, messages_count={len(messages)}, tools_count={len(tools)}")
+            
+            if not messages:
+                self.send_error(400, "No messages provided")
+                return
+            
+            # Truncate large prompts to fit context window
+            messages = self._truncate_messages(messages)
+            
+            # Build request payload for qllmd
+            request_data = {
+                'messages': messages,
+                'stream': stream,
+            }
+            if tools:
+                request_data['tools'] = tools
+            
+            messages_json = json.dumps(request_data)
+            
+            # Handle streaming
+            if stream:
+                # Reduce max_tokens for faster response
+                data['max_tokens'] = min(data.get('max_tokens', 512), 256)
+                messages = self._truncate_messages(messages, max_system_length=4096)
+                request_data['messages'] = messages
+                messages_json = json.dumps(request_data)
+                self._handle_streaming_chat(model, messages_json)
+            else:
+                self._handle_regular_chat(model, messages_json)
+                
+        except Exception as e:
+            logger.error(f"Error in chat completions: {e}")
+            self.send_error(500, str(e))
+    
+    def _handle_streaming_chat(self, model, messages_json):
+        """Handle streaming chat completions - true streaming from qllmd"""
+        chunk_id = f"chatcmpl-{int(time.time())}"
+        created = int(time.time())
+        
+        # Use HTTP/1.1 for better compatibility
+        self.protocol_version = 'HTTP/1.1'
+        
+        logger.info(f"Streaming request started for model: {model}")
+        
+        try:
+            # Send SSE headers
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'keep-alive')
+            self.send_header('X-Accel-Buffering', 'no')
+            self.end_headers()
+            
+            # Stream chunks to client in real-time as they arrive from qllmd
+            self._stream_from_qllmd(chunk_id, created, model, messages_json)
+
+            # Emit a final OpenAI-compatible empty completion chunk before the [DONE]
+            # Some clients (notably Bun-based TUI clients) expect a final top-level
+            # completion object with an empty choices array prior to the [DONE] sentinel.
+            # Estimate token usage (rough heuristic, matches non-streaming path)
+            prompt_tokens_est = len(messages_json) // 4
+            final_chunk = {
+                "id": chunk_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model,
+                "system_fingerprint": "libqllm-1.0",
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": prompt_tokens_est,
+                    "completion_tokens": 0,
+                    "total_tokens": prompt_tokens_est
+                }
+            }
+            try:
+                self.wfile.write(f"data: {json.dumps(final_chunk)}\n\n".encode())
+                self.wfile.flush()
+            except Exception:
+                # Best-effort: if the client disconnected or write fails, continue to send [DONE]
+                pass
+
+            # Send [DONE]
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            
+            logger.info(f"POST /v1/chat/completions (streaming) completed")
+            
+        except Exception as e:
+            logger.error(f"Streaming error: {e}")
+            # Send error chunk and done
+            error_chunk = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "system_fingerprint": "libqllm-1.0",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
+            }
+            self.wfile.write(f"data: {json.dumps(error_chunk)}\n\n".encode())
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+    
+    def _stream_from_qllmd(self, chunk_id, created, model, messages_json):
+        """Stream chunks from qllmd to client in real-time"""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(120)
+            sock.connect((QLLMD_HOST, QLLMD_PORT))
+            
+            # Initialize chat session
+            sock.sendall(b'chat\n')
+            time.sleep(0.1)
+            
+            # Send messages command with stream flag
+            cmd = f'messages {messages_json}\n'
+            sock.sendall(cmd.encode('utf-8'))
+            
+            # Read streaming response and forward to client in real-time
+            buffer = ""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                
+                buffer += chunk.decode('utf-8', errors='replace')
+                
+                # Process complete SSE messages
+                while '\n\n' in buffer:
+                    msg, buffer = buffer.split('\n\n', 1)
+                    if msg.startswith('data: '):
+                        qllm_data = msg[6:]  # Remove 'data: ' prefix
+                        try:
+                            data = json.loads(qllm_data)
+                            chunk_type = data.get('type', '')
+                            
+                            if chunk_type == 'start':
+                                # Send role chunk
+                                role_chunk = {
+                                    "id": chunk_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model,
+                                    "system_fingerprint": "libqllm-1.0",
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"role": "assistant"},
+                                        "finish_reason": None
+                                    }]
+                                }
+                                self.wfile.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
+                                
+                            elif chunk_type == 'chunk':
+                                delta = data.get('delta', '')
+                                content_chunk = {
+                                    "id": chunk_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model,
+                                    "system_fingerprint": "libqllm-1.0",
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"content": delta},
+                                        "finish_reason": None
+                                    }]
+                                }
+                                self.wfile.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                                
+                            elif chunk_type == 'stop':
+                                finish_reason = data.get('finish_reason', 'stop')
+                                finish_chunk = {
+                                    "id": chunk_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model,
+                                    "system_fingerprint": "libqllm-1.0",
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {},
+                                        "finish_reason": finish_reason
+                                    }]
+                                }
+                                self.wfile.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
+                                
+                        except json.JSONDecodeError:
+                            logger.warning(f"Failed to parse chunk: {qllm_data}")
+                
+                self.wfile.flush()
+            
+            sock.close()
+            logger.info(f"Finished streaming from qllmd")
+            
+        except socket.timeout:
+            raise Exception("qllmd request timeout")
+        except Exception as e:
+            raise Exception(f"qllmd streaming error: {e}")
+    
+    def _handle_regular_chat(self, model, messages_json):
+        """Handle regular (non-streaming) chat completions"""
+        # Query qllmd with messages command
+        response_text = self._query_qllmd_messages(messages_json)
+        
+        # Format OpenAI response
+        response = {
+            "id": f"chatcmpl-{int(time.time())}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": response_text
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": len(messages_json) // 4,  # Rough estimate
+                "completion_tokens": len(response_text) // 4,
+                "total_tokens": (len(messages_json) + len(response_text)) // 4
+            }
+        }
+        
+        # Send response
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(response).encode())
+        
+        logger.info(f"POST /v1/chat/completions - {len(messages_json)} chars prompt, {len(response_text)} chars response")
+    
+    def handle_completions(self):
+        """Handle /v1/completions endpoint"""
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body)
+            
+            prompt = data.get('prompt', '')
+            model = data.get('model', 'phi-3-mini')
+            
+            if not prompt:
+                self.send_error(400, "No prompt provided")
+                return
+            
+            # For simple completions, use the old ask command
+            response_text = self._query_qllmd_ask(prompt)
+            
+            # Format OpenAI response
+            response = {
+                "id": f"cmpl-{int(time.time())}",
+                "object": "text_completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{
+                    "text": response_text,
+                    "index": 0,
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": len(prompt) // 4,
+                    "completion_tokens": len(response_text) // 4,
+                    "total_tokens": (len(prompt) + len(response_text)) // 4
+                }
+            }
+            
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(response).encode())
+            
+            logger.info(f"POST /v1/completions - {len(prompt)} chars prompt, {len(response_text)} chars response")
+            
+        except Exception as e:
+            logger.error(f"Error in completions: {e}")
+            self.send_error(500, str(e))
+    
+    def _query_qllmd_messages(self, messages_json, timeout=60):
+        """Query qllmd with JSON message array using 'messages' command
+        
+        Args:
+            messages_json: JSON string of message array
+            timeout: Socket timeout in seconds
+        
+        Returns:
+            Generated text response
+        """
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect((QLLMD_HOST, QLLMD_PORT))
+            
+            # Initialize chat session
+            sock.sendall(b'chat\n')
+            time.sleep(0.1)
+            
+            # Send messages command
+            cmd = f'messages {messages_json}\n'
+            sock.sendall(cmd.encode('utf-8'))
+            
+            # Read streaming response until delimiter
+            response = b''
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+                if b'\x04' in response:  # Delimiter found
+                    break
+            
+            sock.close()
+            
+            # Remove delimiter and decode
+            response = response.split(b'\x04')[0]
+            return response.decode('utf-8', errors='replace').strip()
+            
+        except socket.timeout:
+            raise Exception("qllmd request timeout")
+        except Exception as e:
+            raise Exception(f"qllmd connection error: {e}")
+    
+    def _query_qllmd_ask(self, prompt, timeout=60):
+        """Query qllmd with simple ask command (legacy, for /v1/completions)
+        
+        Args:
+            prompt: Text prompt
+            timeout: Socket timeout in seconds
+        
+        Returns:
+            Generated text response
+        """
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect((QLLMD_HOST, QLLMD_PORT))
+            
+            # Initialize chat session
+            sock.sendall(b"chat\n")
+            time.sleep(0.1)
+            
+            # Send query
+            msg = f"ask {prompt}\n".encode('utf-8')
+            sock.sendall(msg)
+            
+            # Receive response
+            response = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+                # Check for delimiter (ASCII 4)
+                if b'\x04' in response:
+                    break
+            
+            sock.close()
+            
+            # Clean up response (remove delimiter)
+            response_text = response.decode('utf-8', errors='replace')
+            response_text = response_text.replace('\x04', '').strip()
+            
+            return response_text
+            
+        except Exception as e:
+            raise Exception(f"Failed to query qllmd: {e}")
+    
+    def _query_qllmd_streaming(self, request_json, timeout=120):
+        """Query qllmd with streaming request
+        
+        Args:
+            request_json: JSON string with messages, tools, stream flags
+            timeout: Socket timeout in seconds
+        
+        Returns:
+            List of SSE chunks from qllmd
+        """
+        chunks = []
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect((QLLMD_HOST, QLLMD_PORT))
+            
+            # Initialize chat session
+            sock.sendall(b'chat\n')
+            time.sleep(0.1)
+            
+            # Send messages command with stream flag
+            cmd = f'messages {request_json}\n'
+            sock.sendall(cmd.encode('utf-8'))
+            
+            # Read streaming response (SSE format)
+            buffer = ""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                
+                buffer += chunk.decode('utf-8', errors='replace')
+                
+                # Process complete SSE messages
+                while '\n\n' in buffer:
+                    msg, buffer = buffer.split('\n\n', 1)
+                    if msg.startswith('data: '):
+                        chunks.append(msg)
+            
+            sock.close()
+            
+            logger.info(f"Received {len(chunks)} chunks from qllmd")
+            return chunks
+            
+        except socket.timeout:
+            raise Exception("qllmd request timeout")
+        except Exception as e:
+            raise Exception(f"qllmd streaming error: {e}")
+    
+    def log_message(self, format, *args):
+        """Log requests to logger"""
+        logger.info(f"{format % args}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='OpenAI-compatible API server for libqllm')
+    parser.add_argument('--host', default='127.0.0.1', help='Host to bind to (default: 127.0.0.1)')
+    parser.add_argument('--port', type=int, default=8000, help='Port to bind to (default: 8000)')
+    parser.add_argument('--qllmd-host', default='127.0.0.1', help='qllmd host (default: 127.0.0.1)')
+    parser.add_argument('--qllmd-port', type=int, default=4242, help='qllmd port (default: 4242)')
+    args = parser.parse_args()
+    
+    global QLLMD_HOST, QLLMD_PORT
+    QLLMD_HOST = args.qllmd_host
+    QLLMD_PORT = args.qllmd_port
+    
+    # Initialize model info from qllmd
+    logger.info("Initializing connection to qllmd...")
+    initialize_model_info()
+    
+    server = ThreadedHTTPServer((args.host, args.port), QLLMHandler)
+    logger.info(f"qllm-serve: OpenAI-compatible API server")
+    logger.info(f"Listening on {args.host}:{args.port}")
+    logger.info(f"Proxying to qllmd at {QLLMD_HOST}:{QLLMD_PORT}")
+    logger.info(f"")
+    logger.info(f"Endpoints:")
+    logger.info(f"  GET  http://{args.host}:{args.port}/v1/models")
+    logger.info(f"  GET  http://{args.host}:{args.port}/health")
+    logger.info(f"  POST http://{args.host}:{args.port}/v1/chat/completions")
+    logger.info(f"  POST http://{args.host}:{args.port}/v1/completions")
+    logger.info(f"")
+    logger.info(f"Press Ctrl+C to stop")
+    
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("\nShutting down...")
+        server.shutdown()
+
+
+if __name__ == '__main__':
+    main()
