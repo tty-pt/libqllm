@@ -195,7 +195,9 @@ struct llama_sampler *llama_sampler_init_dist(uint64_t seed);
 
 /* Prototypes added to match libqllm usages */
 struct llama_sampler *llama_sampler_init_top_k(int32_t top_k);
-struct llama_sampler *llama_sampler_init_top_p(float top_p, int keep_order);
+/* Note: mock implementation accepts a float second parameter (tail-free freq)
+ * to match the mock's simplified sampling interface used in tests. */
+struct llama_sampler *llama_sampler_init_top_p(float top_p, float tail_free_freq_z);
 struct llama_sampler *llama_sampler_init_temp(float temp);
 
 llama_token llama_sampler_sample(struct llama_sampler *smpl,
