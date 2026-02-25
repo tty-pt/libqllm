@@ -95,7 +95,9 @@ $(vulkan)/include/shaderc/shaderc.h:
 	tar -xf third_party/vulkan-sdk.tar.xz -C third_party
 
 # Run the test suite (delegates to tests/Makefile)
-.PHONY: test tests
+.PHONY: test tests integration
 test:
-	@echo "[INFO] Running test suite..."
+	@echo "[INFO] Running unit tests..."
 	$(MAKE) -C tests run
+	@echo "[INFO] Running integration test with real LLM..."
+	@MODEL="$(MODEL)" ./scripts/run-integration.sh

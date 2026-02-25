@@ -134,6 +134,7 @@ format_prompt(char *buf, size_t bufsize, const char *user_msg, chat_template_t t
 static size_t
 calc_conversation_size(cJSON *messages, cJSON *tools, chat_template_t template)
 {
+	(void)template;
 	size_t total_size = 0;
 	int num_messages = cJSON_GetArraySize(messages);
 	int i;
@@ -491,18 +492,19 @@ struct ndc_config ndc_config = {
 };
 
 struct qllm_config cfg = {
-	.model_path = qllm_model_path,
-	.n_ctx = 2048,  /* Increased from 512 */
-	.n_threads = 0,
-	.n_contexts = 1,  /* Only 1 sequence - connections will share KV cache */
+    .model_path = qllm_model_path,
+    .n_ctx = 2048,  /* Increased from 512 */
+    .n_threads = 0,
+    .n_contexts = 1,  /* Only 1 sequence - connections will share KV cache */
 	/* Sampling parameters - good defaults for general use */
-	.temperature = 0.7f,
-	.top_k = 40,
-	.top_p = 0.95f,
-	.repeat_penalty = 1.1f,
-	.repeat_last_n = 64,
-	/* Feature flags */
-	.enable_embeddings = 0,  /* Don't need embeddings for chat */
+    .temperature = 0.7f,
+    .top_k = 40,
+    .top_p = 0.95f,
+    .repeat_penalty = 1.1f,
+    .repeat_last_n = 64,
+    /* Feature flags */
+    .enable_embeddings = 0,  /* Don't need embeddings for chat */
+    .n_gpu_layers = 0, /* 0 = auto */
 };
 
 static inline void
@@ -685,6 +687,7 @@ typedef struct {
 	size_t line_pos;
 } stream_ctx_t;
 
+#if 0
 static int
 stream_token_cb(void *ctx, const char *token, size_t len)
 {
@@ -711,6 +714,35 @@ stream_token_cb(void *ctx, const char *token, size_t len)
 	}
 	
 	return 0; /* Continue generation */
+}
+#endif
+
+static char *
+json_escape(const char *str)
+{
+	if (!str)
+		return NULL;
+
+	size_t len = strlen(str);
+	char *escaped = malloc(len * 2 + 1);
+	if (!escaped)
+		return NULL;
+
+	char *p = escaped;
+	const char *s = str;
+	while (*s) {
+		switch (*s) {
+		case '"':  *p++ = '\\'; *p++ = '"';  break;
+		case '\\': *p++ = '\\'; *p++ = '\\'; break;
+		case '\n': *p++ = '\\'; *p++ = 'n';  break;
+		case '\r': *p++ = '\\'; *p++ = 'r';  break;
+		case '\t': *p++ = '\\'; *p++ = 't';  break;
+		default:   *p++ = *s; break;
+		}
+		s++;
+	}
+	*p = '\0';
+	return escaped;
 }
 
 void
@@ -760,17 +792,25 @@ generate_stream(int fd, const char *prompt)
 		if (eoim) {
 			size_t n = (size_t)((char *)eoim - buf);
 			if (n) {
-				char sse_buf[BUFSIZ];
-				int sn = snprintf(sse_buf, sizeof(sse_buf), "data: {\"type\":\"chunk\",\"delta\":\"%.*s\"}\n\n", (int)n, buf);
-				ndc_write(fd, sse_buf, sn);
+				char *escaped = json_escape(buf);
+				if (escaped) {
+					char sse_buf[BUFSIZ];
+					int sn = snprintf(sse_buf, sizeof(sse_buf), "data: {\"type\":\"chunk\",\"delta\":\"%s\"}\n\n", escaped);
+					ndc_write(fd, sse_buf, sn);
+					free(escaped);
+				}
 			}
 			break;
 		}
 
 		/* Output in SSE format */
-		char sse_buf[BUFSIZ];
-		int sn = snprintf(sse_buf, sizeof(sse_buf), "data: {\"type\":\"chunk\",\"delta\":\"%.*s\"}\n\n", (int)buflen, buf);
-		ndc_write(fd, sse_buf, sn);
+		char *escaped = json_escape(buf);
+		if (escaped) {
+			char sse_buf[BUFSIZ];
+			int sn = snprintf(sse_buf, sizeof(sse_buf), "data: {\"type\":\"chunk\",\"delta\":\"%s\"}\n\n", escaped);
+			ndc_write(fd, sse_buf, sn);
+			free(escaped);
+		}
 		
 		/* Check for newline to execute commands */
 		if (strrchr(buf, '\n')) {
@@ -786,6 +826,9 @@ generate_stream(int fd, const char *prompt)
 	
 	/* Send stop event */
 	ndc_writef(fd, "data: {\"type\":\"stop\",\"finish_reason\":\"stop\"}\n\n");
+	
+	/* Send delimiter to signal end of stream */
+	ndc_write(fd, "\x04", 1);
 }
 
 void
@@ -920,8 +963,8 @@ do_INFO(int fd, int argc __attribute__((unused)), char *argv[] __attribute__((un
 	}
 	
 	/* Return JSON response */
-	ndc_writef(fd, "{\"model\":\"%s\",\"template\":\"%s\"}\n",
-	          model_name, template_names[model_template]);
+	ndc_writef(fd, "{\"model\":\"%s\",\"template\":\"%s\",\"n_ctx\":%d}\n",
+	          model_name, template_names[model_template], cfg.n_ctx);
 }
 
 static inline void
@@ -993,7 +1036,7 @@ ndc_disconnect(int fd __attribute__((unused)))
 static void
 usage(char *prog)
 {
-	fprintf(stderr, "Usage: %s [-dr?] [-C PATH] [-u USER] [-k PATH] [-c PATH] [-p PORT] [-S PROMPT] MODEL\n", prog);
+	fprintf(stderr, "Usage: %s [-dr?] [-C PATH] [-u USER] [-k PATH] [-c PATH] [-p PORT] [-S PROMPT] [-g LAYERS] MODEL\n", prog);
 	fprintf(stderr, "    Options:\n");
 	fprintf(stderr, "        -C PATH   changes directory to PATH before starting up.\n");
 	fprintf(stderr, "        -u USER   login as USER before starting up.\n");
@@ -1005,6 +1048,7 @@ usage(char *prog)
 	fprintf(stderr, "        -c SIZE   specify n_ctx (default 2048)\n");
 	fprintf(stderr, "        -n NUM    specify an estimation of concurrent sessions (default 1)\n");
 	fprintf(stderr, "        -S PROMPT set system prompt for all conversations\n");
+    fprintf(stderr, "        -g LAYERS specify max GPU layers (0=auto, default 0)\n");
 	fprintf(stderr, "        -?        display this message.\n");
 }
 
@@ -1066,7 +1110,10 @@ main(int argc, char *argv[])
 	/* Initialize fdis array to zeros */
 	memset(fdis, 0, sizeof(fdis));
 
-	while ((c = getopt(argc, argv, "?dK:k:C:rp:s:n:c:S:")) != -1) switch (c) {
+    while ((c = getopt(argc, argv, "?dK:k:C:rp:s:n:c:S:g:")) != -1) switch (c) {
+        case 'g':
+            cfg.n_gpu_layers = atoi(optarg);
+            break;
 		case 'd':
 			ndc_config.flags &= ~NDC_DETACH;
 			break;
@@ -1111,7 +1158,10 @@ main(int argc, char *argv[])
 
 	optind = 1;
 
-	while ((c = getopt(argc, argv, "?dK:k:C:rp:s:n:c:")) != -1) switch (c) {
+    while ((c = getopt(argc, argv, "?dK:k:C:rp:s:n:c:g:")) != -1) switch (c) {
+        case 'g':
+            cfg.n_gpu_layers = atoi(optarg);
+            break;
 		case 'K':
 			ndc_certs_add(optarg);
 			break;

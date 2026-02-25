@@ -591,6 +591,24 @@ llama_sampler_init_dist(uint64_t seed)
 	return calloc(1, sizeof(struct llama_sampler));
 }
 
+struct llama_sampler *
+llama_sampler_init_top_k(int32_t top_k)
+{
+	return calloc(1, sizeof(struct llama_sampler));
+}
+
+struct llama_sampler *
+llama_sampler_init_top_p(float top_p, float tail_free_freq_z)
+{
+	return calloc(1, sizeof(struct llama_sampler));
+}
+
+struct llama_sampler *
+llama_sampler_init_temp(float temp)
+{
+	return calloc(1, sizeof(struct llama_sampler));
+}
+
 llama_token
 llama_sampler_sample(struct llama_sampler *smpl, struct llama_context *ctx, int32_t idx)
 {

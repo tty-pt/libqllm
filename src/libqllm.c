@@ -156,6 +156,72 @@ qllm_decode_tokens(struct qllm_context *qctx,
 extern void
 qllm_backend_mem_check(int gpu, size_t *free_b, size_t *total_b);
 
+static void
+get_model_dims(const char *path, int *n_layers, int *n_embd)
+{
+	struct gguf_init_params ip = { .no_alloc = true };
+	struct gguf_context *ctx;
+
+	*n_layers = 0;
+	*n_embd = 0;
+
+	ctx = gguf_init_from_file(path, ip);
+	if (!ctx)
+		return;
+
+	/* Find architecture key - look for general.architecture */
+	int arch_key = gguf_find_key(ctx, "general.architecture");
+	if (arch_key < 0) {
+		gguf_free(ctx);
+		return;
+	}
+
+	const char *arch = gguf_get_val_str(ctx, arch_key);
+	if (!arch) {
+		gguf_free(ctx);
+		return;
+	}
+
+	/* Build key names: e.g., "llama.block_count", "mistral.embedding_length" */
+	char key[128];
+
+	snprintf(key, sizeof(key), "%s.block_count", arch);
+	int blk_key = gguf_find_key(ctx, key);
+	if (blk_key >= 0) {
+		enum gguf_type type = gguf_get_kv_type(ctx, blk_key);
+		switch (type) {
+		case GGUF_TYPE_UINT8:  *n_layers = gguf_get_val_u8(ctx, blk_key);  break;
+		case GGUF_TYPE_INT8:   *n_layers = gguf_get_val_i8(ctx, blk_key);  break;
+		case GGUF_TYPE_UINT16: *n_layers = gguf_get_val_u16(ctx, blk_key); break;
+		case GGUF_TYPE_INT16:  *n_layers = gguf_get_val_i16(ctx, blk_key); break;
+		case GGUF_TYPE_UINT32: *n_layers = gguf_get_val_u32(ctx, blk_key); break;
+		case GGUF_TYPE_INT32:  *n_layers = gguf_get_val_i32(ctx, blk_key); break;
+		case GGUF_TYPE_UINT64: *n_layers = (int)gguf_get_val_u64(ctx, blk_key); break;
+		case GGUF_TYPE_INT64:  *n_layers = (int)gguf_get_val_i64(ctx, blk_key); break;
+		default: break;
+		}
+	}
+
+	snprintf(key, sizeof(key), "%s.embedding_length", arch);
+	int emb_key = gguf_find_key(ctx, key);
+	if (emb_key >= 0) {
+		enum gguf_type type = gguf_get_kv_type(ctx, emb_key);
+		switch (type) {
+		case GGUF_TYPE_UINT8:  *n_embd = gguf_get_val_u8(ctx, emb_key);  break;
+		case GGUF_TYPE_INT8:   *n_embd = gguf_get_val_i8(ctx, emb_key);  break;
+		case GGUF_TYPE_UINT16: *n_embd = gguf_get_val_u16(ctx, emb_key); break;
+		case GGUF_TYPE_INT16:  *n_embd = gguf_get_val_i16(ctx, emb_key); break;
+		case GGUF_TYPE_UINT32: *n_embd = gguf_get_val_u32(ctx, emb_key); break;
+		case GGUF_TYPE_INT32:  *n_embd = gguf_get_val_i32(ctx, emb_key); break;
+		case GGUF_TYPE_UINT64: *n_embd = (int)gguf_get_val_u64(ctx, emb_key); break;
+		case GGUF_TYPE_INT64:  *n_embd = (int)gguf_get_val_i64(ctx, emb_key); break;
+		default: break;
+		}
+	}
+
+	gguf_free(ctx);
+}
+
 static int
 auto_ngl(const char *path, int gpu, uint32_t n_ctx, uint32_t max_offload_bytes,
 	 int n_layers, int n_embd, int n_contexts)
@@ -291,12 +357,15 @@ auto_ngl(const char *path, int gpu, uint32_t n_ctx, uint32_t max_offload_bytes,
 struct llama_model *model_load(
         const char *path,
         int32_t n_ctx,
-        uint32_t ngl_max,
+        uint32_t n_gpu_layers,
         int32_t n_contexts)
 {
 	struct llama_model_params model_params;
-	struct llama_model ** model_r, *model;
-	int n_layers, n_embd, ngl;
+	struct llama_model *model;
+	int n_layers = 0, n_embd = 0;
+	int ngl = 0;
+
+	(void)n_ctx;
 
     /* Check cache for existing model. qmap stores a pointer-sized value;
      * we store a pointer to a heap-allocated model_cache_entry. qmap_get
@@ -306,22 +375,36 @@ struct llama_model *model_load(
      * Note: With qmap 0.6.0+, pointers remain stable across updates when
      * the new value size <= old size (allocation reuse optimization). */
     {
-        void *slot = qmap_get(model_hd, path);
+        const void *slot = qmap_get(model_hd, path);
         struct model_cache_entry **entry_pp = (struct model_cache_entry **) slot;
         if (entry_pp && *entry_pp) {
             /* existing cache entry: bump refcount and return model */
-            unsigned newv = atomic_fetch_add(&(*entry_pp)->refcount, 1u) + 1u;
+            atomic_fetch_add(&(*entry_pp)->refcount, 1u);
             return (*entry_pp)->model;
         }
-        (void)slot; /* silence unused when debug removed */
     }
 
 	if (!n_contexts)
 		n_contexts = 1;
 
+	/* Get model dimensions from GGUF metadata (fast, no model load) */
+	get_model_dims(path, &n_layers, &n_embd);
+
+    /* Calculate optimal GPU layers - auto mode if n_gpu_layers is 0 */
+    if (n_gpu_layers == 0) {
+        ngl = auto_ngl(path, 0, (uint32_t)n_ctx, 0, n_layers, n_embd, n_contexts);
+    } else {
+        /* Pass-through: user provided number of GPU layers */
+        ngl = (int)n_gpu_layers;
+        if (ngl > n_layers)
+            ngl = n_layers;
+        if (ngl < 0)
+            ngl = 0;
+    }
+
     model_params = llama_model_default_params();
     model_params.split_mode = LLAMA_SPLIT_MODE_LAYER;
-    model_params.n_gpu_layers = 0;
+    model_params.n_gpu_layers = ngl;
 
     /* Load model once. The original implementation probed the file to
      * estimate GPU layers and reloaded the model, but that caused an
@@ -570,7 +653,8 @@ qllm_create(const struct qllm_config *cfg)
     qctx->params = ctx_params;    /* <-- important: save params */
     qctx->model_path = NULL;
 
-    qctx->model = model_load(cfg->model_path, ctx_params.n_ctx, cfg->max_offload_bytes, cfg->n_contexts);
+    /* Pass through n_gpu_layers: 0 => auto, >0 => number of layers to keep on GPU */
+    qctx->model = model_load(cfg->model_path, ctx_params.n_ctx, (uint32_t)cfg->n_gpu_layers, cfg->n_contexts);
 
     if (!qctx->model)
         goto fail;
@@ -830,10 +914,11 @@ qllm_generate_stream_internal(struct qllm_context *qctx,
 					       (int) sizeof(piece),
 					       false,
 					       true);
-		if (n_piece <= 0)
+		if (n_piece <= 0) {
 			continue;
+		}
 
-			qctx->gen_tokens++;
+		qctx->gen_tokens++;
 
 #if defined(MOCK_BUILD)
         /* Debug: report when we would call the user callback */

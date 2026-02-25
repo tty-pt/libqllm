@@ -157,6 +157,46 @@ class QLLMHandler(BaseHTTPRequestHandler):
         
         return truncated
     
+    def calculate_context_strategy(self, model_info, messages, tools, stream=False):
+        """Determine how to handle context limits.
+        
+        Returns: (include_tools: bool, max_system_length: int, reason: str)
+        """
+        if not model_info:
+            logger.warning("No model info available, using default strategy")
+            return (True, 4096 if not stream else 512, "no_model_info")
+        
+        n_ctx = model_info.get('n_ctx', 2048)
+        
+        response_buffer = 256 if stream else 512
+        available = n_ctx - response_buffer
+        
+        messages_json = json.dumps({'messages': messages})
+        messages_tokens = len(messages_json) // 4
+        
+        system_prompt = ""
+        for msg in messages:
+            if msg.get('role') == 'system':
+                system_prompt = msg.get('content', '')
+                break
+        
+        if tools:
+            tools_json = json.dumps(tools)
+            tools_tokens = len(tools_json) // 4
+            total_with_tools = messages_tokens + tools_tokens
+            
+            if total_with_tools <= available:
+                return (True, len(system_prompt), "fits")
+            
+            remaining = available - tools_tokens
+            
+            if remaining > 256:
+                return (True, remaining, "truncate_system")
+            
+            return (False, available, "tools_oversized")
+        
+        return (False, available, "no_tools")
+    
     def handle_chat_completions(self):
         """Handle /v1/chat/completions endpoint"""
         try:
@@ -177,16 +217,22 @@ class QLLMHandler(BaseHTTPRequestHandler):
                 self.send_error(400, "No messages provided")
                 return
             
+            include_tools, max_system, reason = self.calculate_context_strategy(
+                MODEL_INFO, messages, tools, stream)
+            logger.info(f"Context strategy: tools={include_tools}, max_system={max_system}, reason={reason}")
+            
             # Truncate large prompts to fit context window
-            messages = self._truncate_messages(messages)
+            messages = self._truncate_messages(messages, max_system_length=max_system)
             
             # Build request payload for qllmd
             request_data = {
                 'messages': messages,
                 'stream': stream,
             }
-            if tools:
+            if tools and include_tools:
                 request_data['tools'] = tools
+            elif tools and not include_tools:
+                logger.warning(f"Skipping tools: {reason}")
             
             messages_json = json.dumps(request_data)
             
@@ -194,9 +240,6 @@ class QLLMHandler(BaseHTTPRequestHandler):
             if stream:
                 # Reduce max_tokens for faster response
                 data['max_tokens'] = min(data.get('max_tokens', 512), 256)
-                messages = self._truncate_messages(messages, max_system_length=4096)
-                request_data['messages'] = messages
-                messages_json = json.dumps(request_data)
                 self._handle_streaming_chat(model, messages_json)
             else:
                 self._handle_regular_chat(model, messages_json)
@@ -253,29 +296,35 @@ class QLLMHandler(BaseHTTPRequestHandler):
                 pass
 
             # Send [DONE]
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
+            try:
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                logger.info("Client disconnected before [DONE]")
             
             logger.info(f"POST /v1/chat/completions (streaming) completed")
             
         except Exception as e:
             logger.error(f"Streaming error: {e}")
-            # Send error chunk and done
-            error_chunk = {
-                "id": chunk_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "system_fingerprint": "libqllm-1.0",
-                "choices": [{
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": "stop"
-                }]
-            }
-            self.wfile.write(f"data: {json.dumps(error_chunk)}\n\n".encode())
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
+            # Send error chunk and done (best effort)
+            try:
+                error_chunk = {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "system_fingerprint": "libqllm-1.0",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop"
+                    }]
+                }
+                self.wfile.write(f"data: {json.dumps(error_chunk)}\n\n".encode())
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                logger.info("Client disconnected during error handling")
     
     def _stream_from_qllmd(self, chunk_id, created, model, messages_json):
         """Stream chunks from qllmd to client in real-time"""
@@ -324,7 +373,11 @@ class QLLMHandler(BaseHTTPRequestHandler):
                                         "finish_reason": None
                                     }]
                                 }
-                                self.wfile.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
+                                try:
+                                    self.wfile.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
+                                except (BrokenPipeError, ConnectionResetError, OSError):
+                                    logger.info("Client disconnected during streaming")
+                                    break
                                 
                             elif chunk_type == 'chunk':
                                 delta = data.get('delta', '')
@@ -340,7 +393,11 @@ class QLLMHandler(BaseHTTPRequestHandler):
                                         "finish_reason": None
                                     }]
                                 }
-                                self.wfile.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                                try:
+                                    self.wfile.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                                except (BrokenPipeError, ConnectionResetError, OSError):
+                                    logger.info("Client disconnected during streaming")
+                                    break
                                 
                             elif chunk_type == 'stop':
                                 finish_reason = data.get('finish_reason', 'stop')
@@ -356,12 +413,19 @@ class QLLMHandler(BaseHTTPRequestHandler):
                                         "finish_reason": finish_reason
                                     }]
                                 }
-                                self.wfile.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
+                                try:
+                                    self.wfile.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
+                                except (BrokenPipeError, ConnectionResetError, OSError):
+                                    logger.info("Client disconnected during streaming")
+                                    break
                                 
-                        except json.JSONDecodeError:
-                            logger.warning(f"Failed to parse chunk: {qllm_data}")
+                        except json.JSONDecodeError as e:
+                            logger.error(f"Failed to parse chunk: {qllm_data} | Raw: {repr(msg)} | Error: {e}")
                 
-                self.wfile.flush()
+                try:
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    logger.info("Client disconnected during streaming flush")
             
             sock.close()
             logger.info(f"Finished streaming from qllmd")

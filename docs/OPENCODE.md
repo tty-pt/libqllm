@@ -2,6 +2,29 @@
 
 This guide explains how to integrate libqllm with the OpenCode AI coding assistant, allowing you to use local LLM models for code generation and assistance.
 
+## Table of Contents
+
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Prerequisites](#prerequisites)
+- [Quick Start](#quick-start)
+- [Supported Models](#supported-models)
+- [Testing the Setup](#testing-the-setup)
+- [Performance Considerations](#performance-considerations)
+- [Architecture Details](#architecture-details)
+- [Known Limitations](#known-limitations)
+- [Troubleshooting](#troubleshooting)
+- [Advanced Usage](#advanced-usage)
+- [Testing Results](#testing-results)
+- [Contributing](#contributing)
+- [References](#references)
+- [Current Status](#current-status-february-2026)
+  - [What's Working](#whats-working)
+  - [Recommended Models](#recommended-models)
+  - [Context Size Issue](#context-size-issue)
+  - [Code Fix Applied](#code-fix-applied)
+- [Build Notes](#build-notes)
+
 ## Overview
 
 libqllm provides an OpenAI-compatible HTTP API server (`qllm-serve`) that wraps the qllmd daemon, enabling OpenCode to use local GGUF models for inference. This setup gives you complete control over your AI coding assistant without relying on external API services.
@@ -498,30 +521,66 @@ Found issues or have improvements? Please contribute:
 
 ## Current Status (February 2026)
 
-### Working Features
+**TL;DR: Streaming works. Use Mistral-7B-Instruct or Gemma-2-9b-it (8K context). Phi-3-mini (4K) is too small.**
 
-- ✅ Server runs and accepts HTTP connections
-- ✅ OpenAI-compatible API endpoints (/v1/models, /health, /v1/chat/completions)
+### What's Working
+
+- ✅ Streaming chat completions (SSE format)
 - ✅ Non-streaming chat completions
-- ✅ Streaming chat completions (proper SSE format)
-- ✅ System prompt truncation for large prompts
-- ✅ curl and other standard HTTP clients work perfectly
-- ✅ OpenCode connects to server and sends requests
-- ✅ OpenCode receives streaming data (verified via debug logs)
+- ✅ OpenAI-compatible API (/v1/models, /health, /v1/chat/completions)
+- ✅ curl and standard HTTP clients
+- ✅ OpenCode connects and sends requests
 
-### Known Issues
+### Recommended Models
 
-- The OpenCode TUI may hang after receiving data ("build · phi-3" state). This appears to be a display/compatibility issue with how OpenCode's Bun runtime processes the streaming response, even though data is being received correctly.
+| Model | Context | Status |
+|-------|---------|--------|
+| Mistral-7B-Instruct | 8K | ✅ Recommended |
+| Gemma-2-9b-it | 8K | ✅ Recommended |
+| Phi-3.5-mini-instruct | 6K | ⚠️ May work |
+| Phi-3-mini-4k-instruct | 4K | ❌ Too small |
 
-### Debugging
+### Context Size Issue
 
-If you encounter issues, run opencode with debug logging:
+OpenCode sends ~10KB system prompt + 11 tool definitions. Even with aggressive truncation:
+- 4K models: qllm_prime fails → no response
+- 6K models: May work with truncated tools
+- 8K models: Works out of the box
+
+### Code Fix Applied
+
+1. **JSON escaping** in `src/qllmd.c` - Added `json_escape()` function
+2. **Error logging** in `bin/qllm-serve` - Better debugging
+3. **Truncation** - Reduced to 512 chars for streaming
+
+See [Build Notes](#build-notes) for rebuilding.
+
+## Build Notes
+
+After code changes, rebuild and restart:
 ```bash
-opencode --print-logs --log-level DEBUG --model libqllm/phi-3 run "test"
+make
+
+# Restart qllmd with 8K context model (recommended)
+pkill -f qllmd
+LD_LIBRARY_PATH=./lib:$LD_LIBRARY_PATH bin/qllmd -d -p 4242 Mistral-7B-Instruct-v0.3.Q8_0.gguf
+
+# Restart qllm-serve
+pkill -f qllm-serve
+bin/qllm-serve --port 8001 &
 ```
 
-Look for these indicators in the logs:
-- `providerID=libqllm` - Correct provider is selected
-- `service=llm ... stream` - Streaming is enabled
-- `service=message.part.delta publishing` - Data is being received
-- `service=session.processor process` - Request is being processed
+### Verify Streaming Works
+
+```bash
+curl -N http://127.0.0.1:8001/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "mistral", "messages": [{"role": "user", "content": "hi"}], "stream": true}'
+```
+
+### Test with OpenCode
+
+```bash
+opencode run -m libqllm/phi-3 "hello"
+```
+

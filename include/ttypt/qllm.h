@@ -18,9 +18,10 @@ struct qllm_context;
 struct qllm_config {
 	const char   *model_path; /* Required */
 	int32_t       n_ctx;      /* Context size (default 2048) */
-	int32_t       n_threads;  /* Number of CPU threads (default: half of CPUs) */
-	uint32_t      max_offload_bytes; /* Max byte offload */
-	int32_t      n_contexts; /* How many contexts to account for */
+    int32_t       n_threads;  /* Number of CPU threads (default: half of CPUs) */
+    uint32_t      max_offload_bytes; /* Max byte offload (legacy) */
+    int32_t       n_gpu_layers; /* If >0, force number of GPU layers to keep (pass-through -g) */
+    int32_t      n_contexts; /* How many contexts to account for */
 	
 	/* Sampling parameters (added for better generation control) */
 	float         temperature;    /* Temperature (default 0.7, 0.0 = greedy) */
