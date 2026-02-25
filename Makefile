@@ -93,3 +93,9 @@ $(vulkan)/include/shaderc/shaderc.h:
 	mkdir third_party || true
 	wget -qO third_party/vulkan-sdk.tar.xz "$(SDK_URL)"
 	tar -xf third_party/vulkan-sdk.tar.xz -C third_party
+
+# Run the test suite (delegates to tests/Makefile)
+.PHONY: test tests
+test:
+	@echo "[INFO] Running test suite..."
+	$(MAKE) -C tests run
