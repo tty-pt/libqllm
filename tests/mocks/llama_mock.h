@@ -183,7 +183,7 @@ void llama_sampler_chain_add(struct llama_sampler *chain, struct llama_sampler *
 void llama_sampler_free(struct llama_sampler *smpl);
 
 struct llama_sampler *llama_sampler_init(const struct llama_sampler_i *iface,
-					 void *ctx);
+				 void *ctx);
 
 struct llama_sampler *llama_sampler_init_penalties(
 	int32_t last_n,
@@ -192,6 +192,11 @@ struct llama_sampler *llama_sampler_init_penalties(
 	float present);
 
 struct llama_sampler *llama_sampler_init_dist(uint64_t seed);
+
+/* Prototypes added to match libqllm usages */
+struct llama_sampler *llama_sampler_init_top_k(int32_t top_k);
+struct llama_sampler *llama_sampler_init_top_p(float top_p, int keep_order);
+struct llama_sampler *llama_sampler_init_temp(float temp);
 
 llama_token llama_sampler_sample(struct llama_sampler *smpl,
 				 struct llama_context *ctx,
