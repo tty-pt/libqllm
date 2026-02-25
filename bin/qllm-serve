@@ -417,7 +417,8 @@ class QLLMHandler(BaseHTTPRequestHandler):
                                     self.wfile.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
                                 except (BrokenPipeError, ConnectionResetError, OSError):
                                     logger.info("Client disconnected during streaming")
-                                    break
+                                
+                                break  # Exit loop after stop event
                                 
                         except json.JSONDecodeError as e:
                             logger.error(f"Failed to parse chunk: {qllm_data} | Raw: {repr(msg)} | Error: {e}")
