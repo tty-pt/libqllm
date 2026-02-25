@@ -57,7 +57,10 @@ echo "[run-integration] Using model: $MODEL_PATH"
 
 echo "[run-integration] Starting qllmd... (logs -> $QLLMD_LOG)"
 rm -f "$QLLMD_LOG" "$SERVE_LOG" || true
-LD_LIBRARY_PATH="$ROOT/lib:$LD_LIBRARY_PATH" "$QLLMD_BIN" -d -p 4242 "$MODEL_PATH" &> "$QLLMD_LOG" &
+# Preserve existing LD_LIBRARY_PATH if set
+LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:$ROOT/lib"
+export LD_LIBRARY_PATH
+"$QLLMD_BIN" -d -p 4242 "$MODEL_PATH" &> "$QLLMD_LOG" &
 echo $! > "$QLLMD_PID_FILE"
 
 echo "[run-integration] waiting for qllmd to respond to 'info' (timeout 120s)"
