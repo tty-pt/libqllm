@@ -48,6 +48,39 @@ void
 qllm_free(struct qllm_context *ctx);
 
 /*
+ * Get the actual context size used.
+ */
+int
+qllm_n_ctx(struct qllm_context *ctx);
+
+/*
+ * Set the current sequence ID for generation.
+ */
+void
+qllm_set_seq(struct qllm_context *ctx, uint32_t seq_id);
+
+/*
+ * Set a GBNF grammar for constrained decoding.
+ * Pass NULL to disable grammar.
+ */
+int
+qllm_set_grammar(struct qllm_context *ctx, const char *grammar_str);
+
+/*
+ * Create a new sampler chain based on config.
+ */
+struct llama_sampler *
+qllm_sampler_create(struct qllm_context *ctx, const struct qllm_config *cfg);
+
+int
+qllm_sampler_add_grammar(struct qllm_context *ctx,
+			 struct llama_sampler *sampler,
+			 const char *grammar_str);
+
+void
+qllm_sampler_free(struct llama_sampler *smpl);
+
+/*
  * Non-streaming generation.
  * Writes into `out` (user allocated).
  * Returns number of bytes written, or -1 on error.
@@ -113,6 +146,7 @@ qllm_prime(struct qllm_context *ctx,
  */
 int
 qllm_next(struct qllm_context *ctx,
+	  struct llama_sampler *sampler,
 	  char *out,
 	  size_t out_size);
 

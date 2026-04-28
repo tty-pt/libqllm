@@ -627,3 +627,13 @@ void
 llama_sampler_accept(struct llama_sampler *smpl, llama_token token)
 {
 }
+
+struct llama_sampler * llama_sampler_init_grammar(
+    const struct llama_vocab * vocab,
+    const char * grammar_str,
+    const char * grammar_root) {
+    (void)vocab;
+    (void)grammar_str;
+    (void)grammar_root;
+    return calloc(1, sizeof(struct llama_sampler));
+}

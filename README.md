@@ -3,7 +3,7 @@ This is a library that is focused on making LLM usage easy and portable. The ide
 
 This project comes with a few tools for ease-of-use, like a service program to allow for chat sessions, bash completion, and a client program. Also, qllm-list for listing your gguf models, and qllm-path for getting the real path to one.
 
-Additionally, libqllm includes qllm-serve, an OpenAI-compatible HTTP API server that enables integration with AI coding assistants like OpenCode. See docs/OPENCODE.md for the complete integration guide.
+Additionally, `qllmd` exposes an OpenAI-compatible HTTP API directly, so AI coding assistants like OpenCode can use a local GGUF model without a separate proxy. See docs/OPENCODE.md for the complete integration guide.
 
 ## Dependencies
 - **qmap >= 0.6.0** - Hashtable library for efficient model caching with pointer stability
@@ -36,25 +36,34 @@ libqllm can be used as a local model provider for the OpenCode AI coding assista
 
 Quick setup:
 ```sh
-# 1. Start the qllmd daemon
-LD_LIBRARY_PATH=./lib:$LD_LIBRARY_PATH bin/qllmd -d -p 4242 Phi-3-mini-4k-instruct.Q8_0.gguf
+# 1. Find a downloaded GGUF model
+bin/qllm-list
+MODEL="$(bin/qllm-path '*qwen2.5-coder*.gguf')"
 
-# 2. Start the OpenAI-compatible API server
-bin/qllm-serve --port 8001
+# 2. Start qllmd. It serves both the TCP protocol and OpenAI-compatible HTTP.
+LD_LIBRARY_PATH=./lib:$LD_LIBRARY_PATH bin/qllmd -d -p 4242 "$MODEL"
 
-# 3. Configure OpenCode (add opencode.json to your project)
+# 3. Configure OpenCode
+cp opencode.json /path/to/your/project/opencode.json
+```
+
+The included `opencode.json` points OpenCode at `http://127.0.0.1:4242/v1`:
+
+```json
 {
   "provider": {
     "libqllm": {
       "npm": "@ai-sdk/openai-compatible",
-      "options": {"baseURL": "http://localhost:8001/v1", "apiKey": "dummy"},
-      "models": {"phi-3": {"name": "Phi-3", "limit": {"context": 4096, "output": 2048}}}
+      "options": {"baseURL": "http://127.0.0.1:4242/v1", "apiKey": "dummy"},
+      "models": {"qwen2.5-coder": {"name": "qwen2.5-coder", "limit": {"context": 4096, "output": 1024}}}
     }
   }
 }
+```
 
+```sh
 # 4. Use with OpenCode
-opencode run -m libqllm/phi-3 "Write a hello world function"
+opencode run -m libqllm/qwen2.5-coder "Write a hello world function"
 ```
 
 See **docs/OPENCODE.md** for the complete integration guide, including:

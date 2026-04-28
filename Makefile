@@ -34,7 +34,7 @@ LDFLAGS-libqllm := -L${llamacpp}/src -L${ggmlp}
 LDFLAGS-Linux := -L${ggmlp}/ggml-vulkan
 LDFLAGS-Darwin := -L${ggmlp}/ggml-metal -L${ggmlp}/ggml-blas -L${omp}/lib
 
-LDLIBS-qllmd := -lqsys -lndc -lqllm
+LDLIBS-qllmd := -lqsys -lndc -lndx -lqllm
 qllmd-obj-y := third_party/cjson/cJSON.o
 
 LDLIBS-libqllm := -lllama -lggml -lggml-cpu -lggml-base -lqmap -ldl -lpthread -lm -lstdc++
@@ -56,15 +56,23 @@ completions := share/bash-completion/completions
 install-dirs := ${completions}
 install-extra := ${completions}/qllmd
 
-include ./../mk/include.mk
-
 # cJSON dependency for qllmd
+third_party/cjson/cJSON.h:
+	mkdir -p third_party/cjson
+	wget -qO third_party/cjson/cJSON.h https://raw.githubusercontent.com/DaveGamble/cJSON/v1.7.18/cJSON.h
+
+third_party/cjson/cJSON.c: third_party/cjson/cJSON.h
+	wget -qO third_party/cjson/cJSON.c https://raw.githubusercontent.com/DaveGamble/cJSON/v1.7.18/cJSON.c
+
 third_party/cjson/cJSON.o: third_party/cjson/cJSON.c third_party/cjson/cJSON.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 src/qllmd.o: third_party/cjson/cJSON.h
 
-qllmd: third_party/cjson/cJSON.o
+include ./../mk/include.mk
+
+# Ensure bin/qllmd waits for cJSON.o
+bin/qllmd: third_party/cjson/cJSON.o
 
 src/libqllm.o: $(llamacpp)/src/libllama.a
 
@@ -95,9 +103,12 @@ $(vulkan)/include/shaderc/shaderc.h:
 	tar -xf third_party/vulkan-sdk.tar.xz -C third_party
 
 # Run the test suite (delegates to tests/Makefile)
-.PHONY: test tests integration
+.PHONY: test tests integration live-protocol-test
 test:
 	@echo "[INFO] Running unit tests..."
 	$(MAKE) -C tests run
 	@echo "[INFO] Running integration test with real LLM..."
 	@MODEL="$(MODEL)" ./scripts/run-integration.sh
+
+live-protocol-test: bin/qllmd
+	MODEL="$(MODEL)" python3 tests/integration/test_live_protocol.py

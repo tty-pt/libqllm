@@ -18,7 +18,7 @@ This guide explains how to integrate libqllm with the OpenCode AI coding assista
 - [Testing Results](#testing-results)
 - [Contributing](#contributing)
 - [References](#references)
-- [Current Status](#current-status-february-2026)
+- [Current Status](#current-status)
   - [What's Working](#whats-working)
   - [Recommended Models](#recommended-models)
   - [Context Size Issue](#context-size-issue)
@@ -27,15 +27,13 @@ This guide explains how to integrate libqllm with the OpenCode AI coding assista
 
 ## Overview
 
-libqllm provides an OpenAI-compatible HTTP API server (`qllm-serve`) that wraps the qllmd daemon, enabling OpenCode to use local GGUF models for inference. This setup gives you complete control over your AI coding assistant without relying on external API services.
+`qllmd` provides an OpenAI-compatible HTTP API directly, enabling OpenCode to use local GGUF models for inference. This setup gives you complete control over your AI coding assistant without relying on external API services or running a separate proxy.
 
 ## Architecture
 
 ```
 OpenCode CLI
     ↓ (HTTP/OpenAI API)
-qllm-serve (port 8001)
-    ↓ (TCP protocol)
 qllmd daemon (port 4242)
     ↓ (llama.cpp)
 Local GGUF Model
@@ -48,18 +46,13 @@ Local GGUF Model
    make
    ```
 
-2. **Downloaded GGUF model** (recommended: Phi-3-mini-4k-instruct.Q8_0.gguf):
+2. **Downloaded GGUF model** (recommended for OpenCode: Qwen2.5 Coder 3B or another instruct/coder GGUF):
    ```bash
    bin/qllm-list
-   # Download your chosen model to ~/.cache/huggingface/hub/
+   bin/qllm-path '*qwen2.5-coder*.gguf'
    ```
 
-3. **Python 3** with required packages:
-   ```bash
-   pip3 install flask requests
-   ```
-
-4. **OpenCode CLI** installed:
+3. **OpenCode CLI** installed:
    ```bash
    npm install -g opencode
    # or follow instructions at https://opencode.ai
@@ -67,27 +60,19 @@ Local GGUF Model
 
 ## Quick Start
 
-### 1. Start the qllmd daemon
+### 1. Start qllmd
 
 ```bash
 cd /path/to/libqllm
-LD_LIBRARY_PATH=./lib:$LD_LIBRARY_PATH bin/qllmd -d -p 4242 Phi-3-mini-4k-instruct.Q8_0.gguf
+MODEL="$(bin/qllm-path '*qwen2.5-coder*.gguf')"
+LD_LIBRARY_PATH=./lib:$LD_LIBRARY_PATH bin/qllmd -d -p 4242 "$MODEL"
 ```
 
-This starts the daemon on port 4242. The `-d` flag runs it in daemon mode (background).
+This starts the daemon on port 4242. The same port serves the line-based qllmd TCP protocol and the OpenAI-compatible HTTP API (`/v1/...`). The `-d` flag runs it in daemon mode (background).
 
 **Note**: The daemon will take 10-30 seconds to load the model and initialize the shared context.
 
-### 2. Start the API server
-
-```bash
-cd /path/to/libqllm
-bin/qllm-serve --port 8001
-```
-
-This starts the OpenAI-compatible HTTP server on port 8001.
-
-### 3. Configure OpenCode
+### 2. Configure OpenCode
 
 Create or edit `opencode.json` in your project directory (or globally in `~/.config/opencode/`):
 
@@ -99,15 +84,15 @@ Create or edit `opencode.json` in your project directory (or globally in `~/.con
       "npm": "@ai-sdk/openai-compatible",
       "name": "libqllm (local)",
       "options": {
-        "baseURL": "http://localhost:8001/v1",
+        "baseURL": "http://127.0.0.1:4242/v1",
         "apiKey": "dummy"
       },
       "models": {
-        "phi-3": {
-          "name": "Phi-3-mini-4k-instruct (local)",
+        "qwen2.5-coder": {
+          "name": "qwen2.5-coder-3b-instruct-q4_k_m",
           "limit": {
             "context": 4096,
-            "output": 2048
+            "output": 1024
           }
         }
       }
@@ -117,20 +102,20 @@ Create or edit `opencode.json` in your project directory (or globally in `~/.con
 ```
 
 **Configuration notes**:
-- `baseURL`: Must point to your qllm-serve instance (default: `http://localhost:8001/v1`)
+- `baseURL`: Must point to the qllmd HTTP API (default: `http://127.0.0.1:4242/v1`)
 - `apiKey`: Can be any value (e.g., "dummy") since local authentication is not enforced
-- `limit.context`: Should match your model's context window
-- `limit.output`: Maximum tokens for completion (should be ≤ context / 2)
+- `limit.context`: Should not exceed the context passed to qllmd with `-c`
+- `limit.output`: Keep this comfortably below the context size so OpenCode has room for prompts and tool results
 
-### 4. Use OpenCode with libqllm
+### 3. Use OpenCode with libqllm
 
 ```bash
-opencode run -m libqllm/phi-3 "Write a hello world function in Python"
+opencode run -m libqllm/qwen2.5-coder "Write a hello world function in Python"
 ```
 
 Or interactively:
 ```bash
-opencode chat -m libqllm/phi-3
+opencode chat -m libqllm/qwen2.5-coder
 ```
 
 ## Supported Models
@@ -173,13 +158,15 @@ LD_LIBRARY_PATH=./lib:$LD_LIBRARY_PATH bin/qllm-chat -p 4242
 
 Type messages and verify you get responses.
 
-### Test the API server
+### Test the OpenAI-compatible HTTP API
 
 ```bash
-curl -X POST http://localhost:8001/v1/chat/completions \
+curl http://127.0.0.1:4242/health
+curl http://127.0.0.1:4242/v1/models
+curl -X POST http://127.0.0.1:4242/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "phi-3",
+    "model": "qwen2.5-coder",
     "messages": [{"role": "user", "content": "Say hello"}],
     "temperature": 0.7,
     "max_tokens": 50
@@ -193,7 +180,7 @@ You should receive an OpenAI-formatted JSON response.
 ```bash
 cd /tmp/test_project
 cp /path/to/libqllm/opencode.json .
-opencode run -m libqllm/phi-3 "Write a simple test"
+opencode run -m libqllm/qwen2.5-coder "Write a simple test"
 ```
 
 ## Performance Considerations
@@ -250,10 +237,10 @@ Server → Client: <response>\x04
 **Model info command**:
 ```
 Client → Server: info\n
-Server → Client: {"model":"Phi-3-mini-4k-instruct.Q8_0.gguf","template":"phi3"}
+Server → Client: {"model":"qwen2.5-coder-3b-instruct-q4_k_m.gguf","template":"chatml"}
 ```
 
-**qllm-serve HTTP API** (port 8001):
+**qllmd OpenAI-compatible HTTP API** (port 4242):
 - `POST /v1/chat/completions` - OpenAI-compatible chat completions
 - `POST /v1/completions` - OpenAI-compatible text completions
 - `GET /v1/models` - List available models (dynamically detects loaded model)
@@ -295,7 +282,8 @@ The Vulkan backend in llama.cpp cannot handle multiple context instances reliabl
 
 2. Check if model file path is correct:
    ```bash
-   bin/qllm-path Phi-3-mini-4k-instruct.Q8_0.gguf
+   bin/qllm-list
+   bin/qllm-path '*qwen2.5-coder*.gguf'
    ```
 
 3. Verify LD_LIBRARY_PATH is set:
@@ -305,7 +293,7 @@ The Vulkan backend in llama.cpp cannot handle multiple context instances reliabl
 
 ### API returns 500 errors
 
-**Symptom**: qllm-serve returns HTTP 500
+**Symptom**: qllmd returns HTTP 500 from `/v1/chat/completions` or `/v1/completions`
 
 **Solutions**:
 1. Check if qllmd is running:
@@ -325,12 +313,13 @@ The Vulkan backend in llama.cpp cannot handle multiple context instances reliabl
 **Symptom**: OpenCode shows connection errors
 
 **Solutions**:
-1. Verify qllm-serve is running:
+1. Verify qllmd is running and serving HTTP:
    ```bash
-   curl http://localhost:8001/v1/models
+   curl http://127.0.0.1:4242/health
+   curl http://127.0.0.1:4242/v1/models
    ```
 
-2. Check `opencode.json` baseURL matches server port
+2. Check `opencode.json` uses `http://127.0.0.1:4242/v1`
 
 3. Ensure `@ai-sdk/openai-compatible` npm package will be installed by OpenCode
 
@@ -341,7 +330,7 @@ The Vulkan backend in llama.cpp cannot handle multiple context instances reliabl
 **Improvements**:
 - Use smaller models (Phi-3-mini instead of Llama-3-70B)
 - Use lower quantization (Q4_K_M instead of Q8_0)
-- Reduce context size: `bin/qllmd -n 1024 ...`
+- Reduce context size: `bin/qllmd -c 1024 ...`
 - Wait for GPU offload support (future)
 
 ### Model hangs or crashes
@@ -356,7 +345,7 @@ The Vulkan backend in llama.cpp cannot handle multiple context instances reliabl
 
 2. Reduce context size to fit in RAM:
    ```bash
-   bin/qllmd -n 512 -d -p 4242 model.gguf
+   bin/qllmd -c 512 -d -p 4242 model.gguf
    ```
 
 3. Use more aggressive quantization (Q4_K_M)
@@ -389,31 +378,25 @@ make
 Run multiple daemon instances on different ports:
 
 ```bash
-# Terminal 1: Phi-3 on port 4242
-bin/qllmd -d -p 4242 Phi-3-mini-4k-instruct.Q8_0.gguf
+# Terminal 1: Qwen Coder on port 4242
+bin/qllmd -d -p 4242 qwen2.5-coder-3b-instruct-q4_k_m.gguf
 
 # Terminal 2: Mistral on port 4243
 bin/qllmd -d -p 4243 Mistral-7B-Instruct-v0.3.Q8_0.gguf
-
-# Terminal 3: API server for Phi-3
-bin/qllm-serve --port 8001 --qllmd-port 4242
-
-# Terminal 4: API server for Mistral
-bin/qllm-serve --port 8002 --qllmd-port 4243
 ```
 
 Update `opencode.json` with multiple providers:
 ```json
 {
   "provider": {
-    "libqllm-phi3": {
+    "libqllm-qwen": {
       "npm": "@ai-sdk/openai-compatible",
-      "options": {"baseURL": "http://localhost:8001/v1", "apiKey": "dummy"},
-      "models": {"phi-3": {"name": "Phi-3", "limit": {"context": 4096, "output": 2048}}}
+      "options": {"baseURL": "http://127.0.0.1:4242/v1", "apiKey": "dummy"},
+      "models": {"qwen2.5-coder": {"name": "Qwen2.5 Coder", "limit": {"context": 4096, "output": 1024}}}
     },
     "libqllm-mistral": {
       "npm": "@ai-sdk/openai-compatible",
-      "options": {"baseURL": "http://localhost:8002/v1", "apiKey": "dummy"},
+      "options": {"baseURL": "http://127.0.0.1:4243/v1", "apiKey": "dummy"},
       "models": {"mistral": {"name": "Mistral-7B", "limit": {"context": 8192, "output": 4096}}}
     }
   }
@@ -422,7 +405,7 @@ Update `opencode.json` with multiple providers:
 
 ### Startup Script
 
-Create a script to launch both daemons:
+Create a script to launch qllmd:
 
 ```bash
 #!/bin/bash
@@ -432,17 +415,15 @@ cd /path/to/libqllm
 
 # Start qllmd
 export LD_LIBRARY_PATH=./lib:$LD_LIBRARY_PATH
-bin/qllmd -d -p 4242 Phi-3-mini-4k-instruct.Q8_0.gguf
+MODEL="$(bin/qllm-path '*qwen2.5-coder*.gguf')"
+bin/qllmd -d -p 4242 "$MODEL"
 
 # Wait for daemon to initialize
 sleep 15
 
-# Start API server
-bin/qllm-serve --port 8001 &
-
 echo "libqllm services started"
 echo "qllmd: localhost:4242"
-echo "qllm-serve: http://localhost:8001"
+echo "OpenAI API: http://localhost:4242/v1"
 ```
 
 ## Testing Results
@@ -453,7 +434,7 @@ echo "qllm-serve: http://localhost:8001"
 2. **info command** - Returns model info:
    ```
    $ echo "info" | nc localhost 4242
-   {"model":"Phi-3-mini-4k-instruct.Q8_0.gguf","template":"phi3"}
+   {"model":"qwen2.5-coder-3b-instruct-q4_k_m.gguf","template":"chatml"}
    ```
 
 3. **messages command** - Multi-turn conversation:
@@ -469,7 +450,7 @@ echo "qllm-serve: http://localhost:8001"
    Your name is Alice. It was nice to meet you!
    ```
 
-4. **qllm-serve API**:
+4. **qllmd OpenAI-compatible HTTP API**:
    - `GET /v1/models` - Returns detected model
    - `GET /health` - Returns health status
    - `POST /v1/chat/completions` - Works with full conversation history
@@ -477,10 +458,10 @@ echo "qllm-serve: http://localhost:8001"
 ### Example API Response
 
 ```bash
-$ curl -X POST http://localhost:8001/v1/chat/completions \
+$ curl -X POST http://127.0.0.1:4242/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "phi-3",
+    "model": "qwen2.5-coder",
     "messages": [
       {"role": "user", "content": "Write hello world in Python"}
     ]
@@ -501,7 +482,7 @@ $ curl -X POST http://localhost:8001/v1/chat/completions \
 - Multi-turn: ~20-40 seconds
 - Code generation: ~30-60 seconds
 
-(Note: Using Phi-3-mini Q8_0 on CPU)
+(Note: Exact timing depends on model size, quantization, and backend.)
 
 ## Contributing
 
@@ -519,15 +500,16 @@ Found issues or have improvements? Please contribute:
 - **llama.cpp**: https://github.com/ggerganov/llama.cpp
 - **GGUF models**: https://huggingface.co/models?library=gguf
 
-## Current Status (February 2026)
+## Current Status
 
-**TL;DR: Streaming works. Use Mistral-7B-Instruct or Gemma-2-9b-it (8K context). Phi-3-mini (4K) is too small.**
+**TL;DR: Streaming and non-streaming requests work directly through qllmd. Use a coder/instruct model with enough context for OpenCode prompts and tool results.**
 
 ### What's Working
 
 - ✅ Streaming chat completions (SSE format)
 - ✅ Non-streaming chat completions
-- ✅ OpenAI-compatible API (/v1/models, /health, /v1/chat/completions)
+- ✅ Text completions for fill-in-the-middle style autocomplete
+- ✅ OpenAI-compatible API (/v1/models, /health, /v1/chat/completions, /v1/completions)
 - ✅ curl and standard HTTP clients
 - ✅ OpenCode connects and sends requests
 
@@ -535,6 +517,7 @@ Found issues or have improvements? Please contribute:
 
 | Model | Context | Status |
 |-------|---------|--------|
+| Qwen2.5-Coder-3B-Instruct | 32K train / use 4K+ | ✅ Recommended |
 | Mistral-7B-Instruct | 8K | ✅ Recommended |
 | Gemma-2-9b-it | 8K | ✅ Recommended |
 | Phi-3.5-mini-instruct | 6K | ⚠️ May work |
@@ -549,9 +532,9 @@ OpenCode sends ~10KB system prompt + 11 tool definitions. Even with aggressive t
 
 ### Code Fix Applied
 
-1. **JSON escaping** in `src/qllmd.c` - Added `json_escape()` function
-2. **Error logging** in `bin/qllm-serve` - Better debugging
-3. **Truncation** - Reduced to 512 chars for streaming
+1. **Direct HTTP handlers** in `src/qllmd.c` for `/health`, `/v1/models`, `/v1/chat/completions`, and `/v1/completions`
+2. **JSON escaping** in `src/qllmd.c`
+3. **Streaming usage ordering** compatible with OpenAI-style SSE clients
 
 See [Build Notes](#build-notes) for rebuilding.
 
@@ -564,16 +547,12 @@ make
 # Restart qllmd with 8K context model (recommended)
 pkill -f qllmd
 LD_LIBRARY_PATH=./lib:$LD_LIBRARY_PATH bin/qllmd -d -p 4242 Mistral-7B-Instruct-v0.3.Q8_0.gguf
-
-# Restart qllm-serve
-pkill -f qllm-serve
-bin/qllm-serve --port 8001 &
 ```
 
 ### Verify Streaming Works
 
 ```bash
-curl -N http://127.0.0.1:8001/v1/chat/completions \
+curl -N http://127.0.0.1:4242/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "mistral", "messages": [{"role": "user", "content": "hi"}], "stream": true}'
 ```
@@ -581,6 +560,5 @@ curl -N http://127.0.0.1:8001/v1/chat/completions \
 ### Test with OpenCode
 
 ```bash
-opencode run -m libqllm/phi-3 "hello"
+opencode run -m libqllm/qwen2.5-coder "hello"
 ```
-

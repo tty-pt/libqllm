@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <time.h>
+#include <stdarg.h>
 #include <cJSON.h>
 
 #define DEFAULT_SEQ_MAX 4
@@ -29,18 +30,31 @@ typedef struct {
 typedef struct fd_info {
 	char			line_buf[BUFSIZ * 4];
 	struct qllm_context *	ctx;
+	struct llama_sampler *  sampler;
 	unsigned		line_pos;
 	token_queue_t		queue;
 } fdi_t;
 
 fdi_t fdis[FD_SETSIZE], general;
 
+static void fdi_init(fdi_t *fdi, int fd);
+
 const char delimiter = 4;
+
+/* GBNF grammar to enforce tool call syntax: <tool_call>name|args</tool_call>
+ * This ensures the model always produces syntactically correct tool calls.
+ */
+static const char *tool_call_grammar = 
+    "root ::= (text | tool_call)*\n"
+    "text ::= [^<]+\n"
+    "tool_call ::= \"<tool_call>\" name \"|\" args \"</tool_call>\"\n"
+    "name ::= [a-zA-Z0-9_]+\n"
+    "args ::= [^<]+\n";
 
 size_t crb_len = 0;
 char *crb = NULL;
 
-static char qllm_model_path[BUFSIZ];
+char qllm_model_path[BUFSIZ];
 static char system_prompt[BUFSIZ] = "";  /* Optional system prompt */
 
 /* Chat template types */
@@ -49,7 +63,13 @@ typedef enum {
 	TEMPLATE_PHI3,
 	TEMPLATE_MISTRAL,
 	TEMPLATE_GEMMA,
+	TEMPLATE_CHATML,
 } chat_template_t;
+
+/* FIM tokens for autocomplete */
+const char *fim_prefix = NULL;
+const char *fim_suffix = NULL;
+const char *fim_middle = NULL;
 
 static chat_template_t model_template = TEMPLATE_GENERIC;
 
@@ -59,7 +79,56 @@ static const char *template_names[] = {
 	[TEMPLATE_PHI3]    = "phi3",
 	[TEMPLATE_MISTRAL] = "mistral",
 	[TEMPLATE_GEMMA]   = "gemma",
+	[TEMPLATE_CHATML]  = "chatml",
 };
+
+typedef struct message_view {
+	const char *role;
+	const char *content;
+} message_view_t;
+
+static int
+appendf(char *buf, size_t bufsize, size_t *pos, const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+
+	if (*pos >= bufsize)
+		return -1;
+
+	va_start(ap, fmt);
+	n = vsnprintf(buf + *pos, bufsize - *pos, fmt, ap);
+	va_end(ap);
+	if (n < 0)
+		return -1;
+
+	if ((size_t)n >= bufsize - *pos) {
+		*pos = bufsize;
+		return -1;
+	}
+
+	*pos += (size_t)n;
+	return 0;
+}
+
+static int
+message_view_get(cJSON *msg, message_view_t *view)
+{
+	cJSON *role;
+	cJSON *content;
+
+	if (!msg || !view)
+		return 0;
+
+	role = cJSON_GetObjectItem(msg, "role");
+	content = cJSON_GetObjectItem(msg, "content");
+	if (!role || !role->valuestring || !content || !content->valuestring)
+		return 0;
+
+	view->role = role->valuestring;
+	view->content = content->valuestring;
+	return 1;
+}
 
 /* Detect model type from path */
 static chat_template_t
@@ -75,6 +144,8 @@ detect_model_template(const char *path)
 		return TEMPLATE_MISTRAL;
 	else if (strcasestr(path, "gemma"))
 		return TEMPLATE_GEMMA;
+	else if (strcasestr(path, "qwen"))
+		return TEMPLATE_CHATML;
 	
 	return TEMPLATE_GENERIC;
 }
@@ -111,6 +182,15 @@ format_prompt(char *buf, size_t bufsize, const char *user_msg, chat_template_t t
 			              system_prompt, user_msg);
 		else
 			ret = snprintf(buf, bufsize, "<start_of_turn>user\n%s<end_of_turn>\n<start_of_turn>model\n", user_msg);
+		break;
+		
+	case TEMPLATE_CHATML:
+		/* ChatML format: <|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{msg}<|im_end|>\n<|im_start|>assistant\n */
+		if (has_system)
+			ret = snprintf(buf, bufsize, "<|im_start|>system\n%s<|im_end|>\n<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", 
+			              system_prompt, user_msg);
+		else
+			ret = snprintf(buf, bufsize, "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", user_msg);
 		break;
 		
 	case TEMPLATE_GENERIC:
@@ -194,7 +274,7 @@ format_tools(cJSON *tools)
 	if (!buf)
 		return NULL;
 	
-	pos += snprintf(buf + pos, bufsize - pos,
+	appendf(buf, bufsize, &pos,
 		"\n\nYou have access to functions. To call a function, use:\n"
 		"<tool_call>function_name|arguments</tool_call>\n\n"
 		"Available tools:\n");
@@ -216,30 +296,30 @@ format_tools(cJSON *tools)
 		if (!name || !name->valuestring)
 			continue;
 		
-		pos += snprintf(buf + pos, bufsize - pos, "%d. %s\n", i + 1, name->valuestring);
+		appendf(buf, bufsize, &pos, "%d. %s\n", i + 1, name->valuestring);
 		
 		if (desc && desc->valuestring) {
-			pos += snprintf(buf + pos, bufsize - pos, "   %s\n", desc->valuestring);
+			appendf(buf, bufsize, &pos, "   %s\n", desc->valuestring);
 		}
 		
 		if (params && cJSON_IsObject(params)) {
 			cJSON *props = cJSON_GetObjectItem(params, "properties");
 			if (props && cJSON_IsObject(props)) {
-				pos += snprintf(buf + pos, bufsize - pos, "   Parameters: ");
+				appendf(buf, bufsize, &pos, "   Parameters: ");
 				/* Print first few properties */
 				int prop_count = 0;
 				cJSON *prop = props->child;
 				while (prop && prop_count < 3) {
-					pos += snprintf(buf + pos, bufsize - pos, "%s%s",
+					appendf(buf, bufsize, &pos, "%s%s",
 						prop_count > 0 ? ", " : "",
 						prop->string);
 					prop = prop->next;
 					prop_count++;
 				}
-				pos += snprintf(buf + pos, bufsize - pos, "\n");
+				appendf(buf, bufsize, &pos, "\n");
 			}
 		}
-		pos += snprintf(buf + pos, bufsize - pos, "\n");
+		appendf(buf, bufsize, &pos, "\n");
 		
 		if (pos >= bufsize - 100)
 			break;
@@ -252,14 +332,45 @@ format_tools(cJSON *tools)
  * Returns: allocated buffer with formatted conversation, or NULL on error
  * Caller must free() the returned buffer
  */
+extern struct qllm_config cfg;
+
+static int
+calculate_max_system(cJSON *messages, cJSON *tools, int stream)
+{
+	int n_ctx = cfg.n_ctx > 0 ? cfg.n_ctx : 2048;
+	int response_buffer = stream ? 256 : 512;
+	int available = n_ctx - response_buffer;
+	
+	/* Rough token estimation: 4 chars per token */
+	char *messages_json = cJSON_PrintUnformatted(messages);
+	int messages_tokens = messages_json ? (int)strlen(messages_json) / 4 : 0;
+	free(messages_json);
+	
+	if (tools && cJSON_IsArray(tools) && cJSON_GetArraySize(tools) > 0) {
+		char *tools_json = cJSON_PrintUnformatted(tools);
+		int tools_tokens = tools_json ? (int)strlen(tools_json) / 4 : 0;
+		free(tools_json);
+		
+		int total_needed = messages_tokens + tools_tokens;
+		if (total_needed > available) {
+			int remaining = available - tools_tokens;
+			return remaining > 256 ? remaining * 4 : 0;
+		}
+	}
+	
+	int sys_limit = (available - messages_tokens) * 4;
+	return sys_limit > 0 ? sys_limit : 4096;
+}
+
 static char *
-format_conversation(cJSON *messages, cJSON *tools, chat_template_t template, int skip_global_system)
+format_conversation(cJSON *messages, cJSON *tools, chat_template_t template, int skip_global_system, int max_system_len)
 {
 	char *buf;
 	size_t bufsize, pos = 0;
 	int num_messages, i;
 	int has_json_system = 0;
 	const char *json_system_content = NULL;
+	char *truncated_system = NULL;
 	
 	if (!messages || !cJSON_IsArray(messages))
 		return NULL;
@@ -267,33 +378,48 @@ format_conversation(cJSON *messages, cJSON *tools, chat_template_t template, int
 	num_messages = cJSON_GetArraySize(messages);
 	if (num_messages == 0)
 		return NULL;
+
+	/* Check for system message in JSON and handle truncation */
+	for (i = 0; i < num_messages; i++) {
+		cJSON *msg = cJSON_GetArrayItem(messages, i);
+		message_view_t mv;
+
+		if (message_view_get(msg, &mv) && strcmp(mv.role, "system") == 0) {
+			has_json_system = 1;
+			json_system_content = mv.content;
+			
+			if (max_system_len > 0 && (int)strlen(json_system_content) > max_system_len) {
+				const char *suffix = "\n\n[System prompt truncated by qllmd]";
+				truncated_system = malloc((size_t)max_system_len + strlen(suffix) + 1);
+				if (truncated_system) {
+					strncpy(truncated_system, json_system_content, (size_t)max_system_len);
+					truncated_system[max_system_len] = '\0';
+					strcat(truncated_system, suffix);
+					json_system_content = truncated_system;
+				}
+			}
+			break;
+		}
+	}
 	
 	/* Allocate buffer */
 	bufsize = calc_conversation_size(messages, tools, template);
+	/* Adjust buffer size for truncation if needed */
+	if (truncated_system) {
+		bufsize += strlen(truncated_system);
+	}
 	buf = malloc(bufsize);
-	if (!buf)
+	if (!buf) {
+		free(truncated_system);
 		return NULL;
+	}
 	
 	/* Format tools if present */
 	char *tools_text = NULL;
 	if (tools && cJSON_IsArray(tools)) {
 		tools_text = format_tools(tools);
 	}
-	
-	/* Check for system message in JSON */
-	for (i = 0; i < num_messages; i++) {
-		cJSON *msg = cJSON_GetArrayItem(messages, i);
-		cJSON *role = cJSON_GetObjectItem(msg, "role");
-		if (role && role->valuestring && strcmp(role->valuestring, "system") == 0) {
-			cJSON *content = cJSON_GetObjectItem(msg, "content");
-			if (content && content->valuestring) {
-				has_json_system = 1;
-				json_system_content = content->valuestring;
-				break;
-			}
-		}
-	}
-	
+
 	/* Build formatted conversation based on template */
 	switch (template) {
 	case TEMPLATE_PHI3: {
@@ -301,41 +427,40 @@ format_conversation(cJSON *messages, cJSON *tools, chat_template_t template, int
 		
 		/* Add system prompt first (global or JSON) */
 		if (!skip_global_system && system_prompt[0] != '\0') {
-			pos += snprintf(buf + pos, bufsize - pos, "<|system|>\n%s<|end|>\n", system_prompt);
+			appendf(buf, bufsize, &pos, "<|system|>\n%s<|end|>\n", system_prompt);
 		} else if (has_json_system && json_system_content) {
-			pos += snprintf(buf + pos, bufsize - pos, "<|system|>\n%s<|end|>\n", json_system_content);
+			appendf(buf, bufsize, &pos, "<|system|>\n%s<|end|>\n", json_system_content);
 		}
 		
 		/* Add tools description if present */
 		if (tools_text) {
-			pos += snprintf(buf + pos, bufsize - pos, "%s", tools_text);
+			appendf(buf, bufsize, &pos, "%s", tools_text);
 		}
 		
 		/* Process all messages */
 		for (i = 0; i < num_messages; i++) {
 			cJSON *msg = cJSON_GetArrayItem(messages, i);
-			cJSON *role = cJSON_GetObjectItem(msg, "role");
-			cJSON *content = cJSON_GetObjectItem(msg, "content");
+			message_view_t mv;
 			
-			if (!role || !role->valuestring || !content || !content->valuestring)
+			if (!message_view_get(msg, &mv))
 				continue;
 			
-			if (strcmp(role->valuestring, "system") == 0) {
+			if (strcmp(mv.role, "system") == 0) {
 				/* Skip, already handled above */
 				continue;
-			} else if (strcmp(role->valuestring, "user") == 0) {
-				pos += snprintf(buf + pos, bufsize - pos, 
-				               "<|user|>\n%s<|end|>\n", content->valuestring);
-			} else if (strcmp(role->valuestring, "assistant") == 0) {
-				pos += snprintf(buf + pos, bufsize - pos, 
-				               "<|assistant|>\n%s<|end|>\n", content->valuestring);
+			} else if (strcmp(mv.role, "user") == 0) {
+				appendf(buf, bufsize, &pos, "<|user|>\n%s<|end|>\n", mv.content);
+			} else if (strcmp(mv.role, "assistant") == 0) {
+				appendf(buf, bufsize, &pos, "<|assistant|>\n%s<|end|>\n", mv.content);
+			} else if (strcmp(mv.role, "tool") == 0) {
+				appendf(buf, bufsize, &pos, "<|user|>\ntool result:\n%s<|end|>\n", mv.content);
 			}
 			
 			if (pos >= bufsize - 100) break;  /* Safety check */
 		}
 		
 		/* End with assistant marker (ready for generation) */
-		pos += snprintf(buf + pos, bufsize - pos, "<|assistant|>\n");
+		appendf(buf, bufsize, &pos, "<|assistant|>\n");
 		break;
 	}
 	
@@ -345,38 +470,44 @@ format_conversation(cJSON *messages, cJSON *tools, chat_template_t template, int
 		
 		/* Add tools description if present */
 		if (tools_text) {
-			pos += snprintf(buf + pos, bufsize - pos, "%s", tools_text);
+			appendf(buf, bufsize, &pos, "%s", tools_text);
 		}
 		
 		for (i = 0; i < num_messages; i++) {
 			cJSON *msg = cJSON_GetArrayItem(messages, i);
-			cJSON *role = cJSON_GetObjectItem(msg, "role");
-			cJSON *content = cJSON_GetObjectItem(msg, "content");
+			message_view_t mv;
 			
-			if (!role || !role->valuestring || !content || !content->valuestring)
+			if (!message_view_get(msg, &mv))
 				continue;
 			
-			if (strcmp(role->valuestring, "system") == 0) {
+			if (strcmp(mv.role, "system") == 0) {
 				/* Add system at start of first [INST] block */
 				if (!in_user) {
-					pos += snprintf(buf + pos, bufsize - pos, "[INST] %s\n\n", content->valuestring);
+					appendf(buf, bufsize, &pos, "[INST] %s\n\n", mv.content);
 					in_user = 1;
 				}
-			} else if (strcmp(role->valuestring, "user") == 0) {
+			} else if (strcmp(mv.role, "user") == 0) {
 				if (!in_user) {
 					/* Start new [INST] block */
 					if (!skip_global_system && system_prompt[0] != '\0' && pos == 0) {
 						/* Add global system prompt at very start */
-						pos += snprintf(buf + pos, bufsize - pos, "[INST] %s\n\n", system_prompt);
+						appendf(buf, bufsize, &pos, "[INST] %s\n\n", system_prompt);
 					} else {
-						pos += snprintf(buf + pos, bufsize - pos, "[INST] ");
+						appendf(buf, bufsize, &pos, "[INST] ");
 					}
 					in_user = 1;
 				}
-				pos += snprintf(buf + pos, bufsize - pos, "%s [/INST]", content->valuestring);
+				appendf(buf, bufsize, &pos, "%s [/INST]", mv.content);
 				in_user = 0;
-			} else if (strcmp(role->valuestring, "assistant") == 0) {
-				pos += snprintf(buf + pos, bufsize - pos, " %s ", content->valuestring);
+			} else if (strcmp(mv.role, "assistant") == 0) {
+				appendf(buf, bufsize, &pos, " %s ", mv.content);
+			} else if (strcmp(mv.role, "tool") == 0) {
+				if (!in_user) {
+					appendf(buf, bufsize, &pos, "[INST] ");
+					in_user = 1;
+				}
+				appendf(buf, bufsize, &pos, "tool result:\n%s [/INST]", mv.content);
+				in_user = 0;
 			}
 			
 			if (pos >= bufsize - 100) break;
@@ -392,43 +523,87 @@ format_conversation(cJSON *messages, cJSON *tools, chat_template_t template, int
 		
 		/* Add tools description if present */
 		if (tools_text) {
-			pos += snprintf(buf + pos, bufsize - pos, "%s", tools_text);
+			appendf(buf, bufsize, &pos, "%s", tools_text);
 		}
 		
 		for (i = 0; i < num_messages; i++) {
 			cJSON *msg = cJSON_GetArrayItem(messages, i);
-			cJSON *role = cJSON_GetObjectItem(msg, "role");
-			cJSON *content = cJSON_GetObjectItem(msg, "content");
+			message_view_t mv;
 			
-			if (!role || !role->valuestring || !content || !content->valuestring)
+			if (!message_view_get(msg, &mv))
 				continue;
 			
-			if (strcmp(role->valuestring, "system") == 0) {
+			if (strcmp(mv.role, "system") == 0) {
 				continue;  /* Will be added with first user message */
-			} else if (strcmp(role->valuestring, "user") == 0) {
-				pos += snprintf(buf + pos, bufsize - pos, "<start_of_turn>user\n");
+			} else if (strcmp(mv.role, "user") == 0) {
+				appendf(buf, bufsize, &pos, "<start_of_turn>user\n");
 				
 				/* Add system prompt with first user message */
 				if (!added_system) {
 					if (!skip_global_system && system_prompt[0] != '\0') {
-						pos += snprintf(buf + pos, bufsize - pos, "%s\n\n", system_prompt);
+						appendf(buf, bufsize, &pos, "%s\n\n", system_prompt);
 					} else if (has_json_system && json_system_content) {
-						pos += snprintf(buf + pos, bufsize - pos, "%s\n\n", json_system_content);
+						appendf(buf, bufsize, &pos, "%s\n\n", json_system_content);
 					}
 					added_system = 1;
 				}
 				
-				pos += snprintf(buf + pos, bufsize - pos, "%s<end_of_turn>\n", content->valuestring);
-			} else if (strcmp(role->valuestring, "assistant") == 0) {
-				pos += snprintf(buf + pos, bufsize - pos, 
-				               "<start_of_turn>model\n%s<end_of_turn>\n", content->valuestring);
+				appendf(buf, bufsize, &pos, "%s<end_of_turn>\n", mv.content);
+			} else if (strcmp(mv.role, "assistant") == 0) {
+				appendf(buf, bufsize, &pos,
+				        "<start_of_turn>model\n%s<end_of_turn>\n", mv.content);
+			} else if (strcmp(mv.role, "tool") == 0) {
+				appendf(buf, bufsize, &pos,
+				        "<start_of_turn>user\ntool result:\n%s<end_of_turn>\n", mv.content);
 			}
 			
 			if (pos >= bufsize - 100) break;
 		}
 		
 		/* End with model marker */
-		pos += snprintf(buf + pos, bufsize - pos, "<start_of_turn>model\n");
+		appendf(buf, bufsize, &pos, "<start_of_turn>model\n");
+		break;
+	}
+	
+	case TEMPLATE_CHATML: {
+		/* ChatML format: <|im_start|>role\ncontent<|im_end|>\n */
+		
+		/* Add system prompt first (global or JSON) */
+		if (!skip_global_system && system_prompt[0] != '\0') {
+			appendf(buf, bufsize, &pos, "<|im_start|>system\n%s<|im_end|>\n", system_prompt);
+		} else if (has_json_system && json_system_content) {
+			appendf(buf, bufsize, &pos, "<|im_start|>system\n%s<|im_end|>\n", json_system_content);
+		}
+		
+		/* Add tools description if present */
+		if (tools_text) {
+			appendf(buf, bufsize, &pos, "<|im_start|>system\n%s<|im_end|>\n", tools_text);
+		}
+		
+		/* Process all messages */
+		for (i = 0; i < num_messages; i++) {
+			cJSON *msg = cJSON_GetArrayItem(messages, i);
+			message_view_t mv;
+			
+			if (!message_view_get(msg, &mv))
+				continue;
+			
+			if (strcmp(mv.role, "system") == 0) {
+				/* Skip, already handled above */
+				continue;
+			} else if (strcmp(mv.role, "user") == 0) {
+				appendf(buf, bufsize, &pos, "<|im_start|>user\n%s<|im_end|>\n", mv.content);
+			} else if (strcmp(mv.role, "assistant") == 0) {
+				appendf(buf, bufsize, &pos, "<|im_start|>assistant\n%s<|im_end|>\n", mv.content);
+			} else if (strcmp(mv.role, "tool") == 0) {
+				appendf(buf, bufsize, &pos, "<|im_start|>user\ntool result:\n%s<|im_end|>\n", mv.content);
+			}
+			
+			if (pos >= bufsize - 100) break;
+		}
+		
+		/* End with assistant marker */
+		appendf(buf, bufsize, &pos, "<|im_start|>assistant\n");
 		break;
 	}
 	
@@ -438,44 +613,46 @@ format_conversation(cJSON *messages, cJSON *tools, chat_template_t template, int
 		
 		/* Add system if present */
 		if (!skip_global_system && system_prompt[0] != '\0') {
-			pos += snprintf(buf + pos, bufsize - pos, "%c\nsystem:\n%s", delimiter, system_prompt);
+			appendf(buf, bufsize, &pos, "%c\nsystem:\n%s", delimiter, system_prompt);
 		} else if (has_json_system && json_system_content) {
-			pos += snprintf(buf + pos, bufsize - pos, "%c\nsystem:\n%s", delimiter, json_system_content);
+			appendf(buf, bufsize, &pos, "%c\nsystem:\n%s", delimiter, json_system_content);
 		}
 		
 		/* Add tools description if present */
 		if (tools_text) {
-			pos += snprintf(buf + pos, bufsize - pos, "%s", tools_text);
+			appendf(buf, bufsize, &pos, "%s", tools_text);
 		}
 		
 		/* Process all messages */
 		for (i = 0; i < num_messages; i++) {
 			cJSON *msg = cJSON_GetArrayItem(messages, i);
-			cJSON *role = cJSON_GetObjectItem(msg, "role");
-			cJSON *content = cJSON_GetObjectItem(msg, "content");
+			message_view_t mv;
 			
-			if (!role || !role->valuestring || !content || !content->valuestring)
+			if (!message_view_get(msg, &mv))
 				continue;
 			
-			if (strcmp(role->valuestring, "system") == 0) {
+			if (strcmp(mv.role, "system") == 0) {
 				continue;  /* Already handled */
-			} else if (strcmp(role->valuestring, "user") == 0) {
-				pos += snprintf(buf + pos, bufsize - pos, "%c\nuser:\n%s", delimiter, content->valuestring);
-			} else if (strcmp(role->valuestring, "assistant") == 0) {
-				pos += snprintf(buf + pos, bufsize - pos, "%c\nassistant:\n%s", delimiter, content->valuestring);
+			} else if (strcmp(mv.role, "user") == 0) {
+				appendf(buf, bufsize, &pos, "%c\nuser:\n%s", delimiter, mv.content);
+			} else if (strcmp(mv.role, "assistant") == 0) {
+				appendf(buf, bufsize, &pos, "%c\nassistant:\n%s", delimiter, mv.content);
+			} else if (strcmp(mv.role, "tool") == 0) {
+				appendf(buf, bufsize, &pos, "%c\ntool:\n%s", delimiter, mv.content);
 			}
 			
 			if (pos >= bufsize - 100) break;
 		}
 		
 		/* End with assistant marker */
-		pos += snprintf(buf + pos, bufsize - pos, "%c\nassistant:\n", delimiter);
+		appendf(buf, bufsize, &pos, "%c\nassistant:\n", delimiter);
 		break;
 	}
 	}
 	
-	/* Free tools_text */
+	/* Free tools_text and truncated_system */
 	free(tools_text);
+	free(truncated_system);
 	
 	return buf;
 }
@@ -493,7 +670,7 @@ struct ndc_config ndc_config = {
 
 struct qllm_config cfg = {
     .model_path = qllm_model_path,
-    .n_ctx = 2048,  /* Increased from 512 */
+    .n_ctx = 0,  /* 0 = auto-detect from model */
     .n_threads = 0,
     .n_contexts = 1,  /* Only 1 sequence - connections will share KV cache */
 	/* Sampling parameters - good defaults for general use */
@@ -609,6 +786,24 @@ process_chunk(gen_state_t *st, const char *chunk, size_t len)
 }
 
 
+static int
+check_stop_sequences(const char *buf, cJSON *stop)
+{
+	int i, num_stops;
+	if (!buf || !stop || !cJSON_IsArray(stop))
+		return 0;
+
+	num_stops = cJSON_GetArraySize(stop);
+	for (i = 0; i < num_stops; i++) {
+		cJSON *s = cJSON_GetArrayItem(stop, i);
+		if (cJSON_IsString(s) && s->valuestring[0] != '\0') {
+			if (strstr(buf, s->valuestring))
+				return 1;
+		}
+	}
+	return 0;
+}
+
 static inline int
 inference(int fd, fdi_t *fdi)
 {
@@ -617,7 +812,7 @@ inference(int fd, fdi_t *fdi)
 	size_t	buflen;
 	char	*eoim;
 
-	ret = qllm_next(fdi->ctx, buf, sizeof(buf));
+	ret = qllm_next(fdi->ctx, NULL, buf, sizeof(buf));
 	if (ret < 0)
 		return 0; /* error -> stop */
 
@@ -745,6 +940,61 @@ json_escape(const char *str)
 	return escaped;
 }
 
+typedef struct tool_call {
+	char *content;
+	char *name;
+	char *arguments;
+} tool_call_t;
+
+void
+tool_call_free(tool_call_t *tc)
+{
+	if (tc) {
+		free(tc->content);
+		free(tc->name);
+		free(tc->arguments);
+		memset(tc, 0, sizeof(*tc));
+	}
+}
+
+int
+parse_tool_call(const char *output, tool_call_t *tc)
+{
+
+	const char *start, *bar, *end;
+	size_t content_len, name_len, args_len;
+
+	if (!output || !tc)
+		return 0;
+
+	memset(tc, 0, sizeof(*tc));
+
+	start = strstr(output, "<tool_call>");
+	if (!start)
+		return 0;
+
+	bar = strchr(start + 11, '|');
+	end = strstr(start + 11, "</tool_call>");
+	if (!bar || !end || bar > end)
+		return 0;
+
+	content_len = (size_t)(start - output);
+	name_len = (size_t)(bar - (start + 11));
+	args_len = (size_t)(end - (bar + 1));
+	if (!name_len || !args_len)
+		return 0;
+
+	tc->content = strndup(output, content_len);
+	tc->name = strndup(start + 11, name_len);
+	tc->arguments = strndup(bar + 1, args_len);
+	if (!tc->content || !tc->name || !tc->arguments) {
+		tool_call_free(tc);
+		return 0;
+	}
+
+	return 1;
+}
+
 void
 generate_stream(int fd, const char *prompt)
 {
@@ -778,7 +1028,7 @@ generate_stream(int fd, const char *prompt)
 	fdi->line_pos = 0;
 
 	for (step = 0; step < max_gen; step++) {
-		ret = qllm_next(fdi->ctx, buf, sizeof(buf));
+		ret = qllm_next(fdi->ctx, NULL, buf, sizeof(buf));
 		if (ret < 0)
 			break; /* error */
 		if (ret == 0)
@@ -829,6 +1079,573 @@ generate_stream(int fd, const char *prompt)
 	
 	/* Send delimiter to signal end of stream */
 	ndc_write(fd, "\x04", 1);
+}
+
+/* HTTP handlers for OpenAI-compatible API */
+
+static void
+http_json(socket_t fd, int code, const char *body)
+{
+	ndc_header_set(fd, "Content-Type", "application/json");
+	ndc_respond(fd, code, body);
+}
+
+static void
+http_error(socket_t fd, int code, const char *type, const char *message)
+{
+	char *escaped_type = json_escape(type ? type : "internal_error");
+	char *escaped_message = json_escape(message ? message : "Internal error");
+	char *response = NULL;
+
+	if (!escaped_type || !escaped_message ||
+	    asprintf(&response, "{\"error\":{\"message\":\"%s\",\"type\":\"%s\"}}",
+	             escaped_message, escaped_type) < 0) {
+		http_json(fd, 500, "{\"error\":{\"message\":\"Out of memory\",\"type\":\"internal_error\"}}");
+		free(escaped_type);
+		free(escaped_message);
+		return;
+	}
+
+	http_json(fd, code, response);
+	free(response);
+	free(escaped_type);
+	free(escaped_message);
+}
+
+static void
+http_sse_start(socket_t fd)
+{
+	ndc_header_set(fd, "Content-Type", "text/event-stream");
+	ndc_header_set(fd, "Cache-Control", "no-cache");
+	ndc_header_set(fd, "Connection", "close");
+	ndc_respond(fd, 200, NULL);
+}
+
+static void
+oai_stream_role(socket_t fd, const char *completion_id)
+{
+	ndc_writef(fd,
+		"data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"index\":0,\"finish_reason\":null}]}\n\n",
+		completion_id);
+}
+
+static void
+oai_stream_content(socket_t fd, const char *completion_id, const char *content)
+{
+	char *escaped = json_escape(content);
+
+	if (!escaped)
+		return;
+
+	ndc_writef(fd,
+		"data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"%s\"},\"index\":0,\"finish_reason\":null}]}\n\n",
+		completion_id, escaped);
+	free(escaped);
+}
+
+static void
+oai_stream_tool_call(socket_t fd, const char *completion_id, const tool_call_t *tool_call)
+{
+	char *escaped_name;
+	char *escaped_args;
+
+	if (!tool_call)
+		return;
+
+	escaped_name = json_escape(tool_call->name);
+	escaped_args = json_escape(tool_call->arguments);
+	if (escaped_name && escaped_args) {
+		ndc_writef(fd,
+			"data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_%ld_0\",\"type\":\"function\",\"function\":{\"name\":\"%s\",\"arguments\":\"%s\"}}]},\"index\":0,\"finish_reason\":null}]}\n\n",
+			completion_id, (long)time(NULL), escaped_name, escaped_args);
+	}
+
+	free(escaped_name);
+	free(escaped_args);
+}
+
+static void
+oai_stream_stop(socket_t fd, const char *completion_id, const char *finish_reason)
+{
+	ndc_writef(fd,
+		"data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"%s\"}]}\n\n",
+		completion_id, finish_reason);
+}
+
+static char *
+oai_completion_json(
+	const char *completion_id,
+	const char *model_name,
+	const char *content,
+	const tool_call_t *tool_call,
+	int prompt_tokens,
+	int completion_tokens)
+{
+	char *escaped_model = NULL;
+	char *escaped_content = NULL;
+	char *response = NULL;
+	const char *short_name;
+
+	short_name = strrchr(model_name, '/');
+	short_name = short_name ? short_name + 1 : model_name;
+
+	escaped_model = json_escape(short_name);
+	escaped_content = json_escape(content ? content : "");
+	if (!escaped_model || !escaped_content)
+		goto out;
+
+	if (tool_call) {
+		char *escaped_name = json_escape(tool_call->name);
+		char *escaped_args = json_escape(tool_call->arguments);
+
+		if (escaped_name && escaped_args) {
+			if (asprintf(&response,
+				"{\"id\":\"%s\",\"object\":\"chat.completion\",\"created\":%ld,\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\",\"tool_calls\":[{\"id\":\"call_%ld_0\",\"type\":\"function\",\"function\":{\"name\":\"%s\",\"arguments\":\"%s\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",
+				completion_id, (long)time(NULL), escaped_model, escaped_content,
+				(long)time(NULL), escaped_name, escaped_args,
+				prompt_tokens, completion_tokens,
+				prompt_tokens + completion_tokens) < 0)
+				response = NULL;
+		}
+
+		free(escaped_name);
+		free(escaped_args);
+	} else {
+		if (asprintf(&response,
+			"{\"id\":\"%s\",\"object\":\"chat.completion\",\"created\":%ld,\"model\":\"%s\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",
+			completion_id, (long)time(NULL), escaped_model, escaped_content,
+			prompt_tokens, completion_tokens,
+			prompt_tokens + completion_tokens) < 0)
+			response = NULL;
+	}
+
+out:
+	free(escaped_model);
+	free(escaped_content);
+	return response;
+}
+
+int
+handle_health(socket_t fd, char *body __attribute__((unused)))
+{
+	http_json(fd, 200, "{\"status\":\"ok\"}");
+	return 1;
+}
+
+int
+handle_v1_completions(socket_t fd, char *body)
+{
+	cJSON *root = NULL;
+	cJSON *prompt_val = NULL;
+	cJSON *suffix_val = NULL;
+	cJSON *stop = NULL;
+	cJSON *model_val = NULL;
+	char *final_prompt = NULL;
+	char completion_id[64];
+
+	snprintf(completion_id, sizeof(completion_id), "cmpl-%ld", (long)time(NULL));
+
+	if (!body || !*body) {
+		http_error(fd, 400, "invalid_request_error", "Missing request body");
+		return 1;
+	}
+
+	root = cJSON_Parse(body);
+	if (!root) {
+		http_error(fd, 400, "invalid_request_error", "Invalid JSON");
+		return 1;
+	}
+
+	prompt_val = cJSON_GetObjectItem(root, "prompt");
+	suffix_val = cJSON_GetObjectItem(root, "suffix");
+	stop = cJSON_GetObjectItem(root, "stop");
+	model_val = cJSON_GetObjectItem(root, "model");
+
+	if (!prompt_val || !cJSON_IsString(prompt_val)) {
+		http_error(fd, 400, "invalid_request_error", "prompt must be a string");
+		cJSON_Delete(root);
+		return 1;
+	}
+
+	/* Handle FIM (Fill-In-The-Middle) if suffix is provided */
+	if (suffix_val && cJSON_IsString(suffix_val) && suffix_val->valuestring[0] != '\0') {
+		if (asprintf(&final_prompt, "%s%s%s%s%s", 
+		             fim_prefix, prompt_val->valuestring, 
+		             fim_suffix, suffix_val->valuestring, 
+		             fim_middle) < 0) {
+			http_error(fd, 500, "internal_error", "Out of memory");
+			cJSON_Delete(root);
+			return 1;
+		}
+	} else {
+		final_prompt = strdup(prompt_val->valuestring);
+	}
+
+	/* Initialize fdi and context */
+	fdi_init(&fdis[fd], fd);
+	qllm_set_grammar(fdis[fd].ctx, NULL); /* No grammar for raw completions */
+
+	/* Generate response (non-streaming for now as FIM is usually fast) */
+	fdi_t *fdi = &fdis[fd];
+	char buf[4096];
+	char full_response[BUFSIZ * 16];
+	size_t full_len = 0;
+	int ret, step;
+	int max_gen = 128; /* Autocomplete usually wants short bursts */
+
+	full_response[0] = '\0';
+	
+	qllm_anchor_start(fdi->ctx);
+	if (qllm_prime(fdi->ctx, final_prompt) < 0) {
+		http_error(fd, 500, "internal_error", "Generation failed");
+		free(final_prompt);
+		cJSON_Delete(root);
+		return 1;
+	}
+	qllm_anchor_end(fdi->ctx);
+	
+	for (step = 0; step < max_gen; step++) {
+		ret = qllm_next(fdi->ctx, fdi->sampler, buf, sizeof(buf));
+		if (ret <= 0) break;
+		
+		char *delim = memchr(buf, delimiter, ret);
+		if (delim) {
+			*delim = '\0';
+			ret = delim - buf;
+		}
+		
+		if (ret > 0) {
+			size_t copy_len = (size_t)ret;
+			if (copy_len > sizeof(full_response) - full_len - 1)
+				copy_len = sizeof(full_response) - full_len - 1;
+			memcpy(full_response + full_len, buf, copy_len);
+			full_len += copy_len;
+			full_response[full_len] = '\0';
+		}
+		
+		if (delim || check_stop_sequences(full_response, stop))
+			break;
+	}
+
+	/* Format OpenAI Completion response */
+	char *model_name = model_val && cJSON_IsString(model_val) ? model_val->valuestring : "local-model";
+	char *escaped_content = json_escape(full_response);
+	char *response_json = NULL;
+
+	if (asprintf(&response_json, 
+		"{\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":\"%s\",\"choices\":[{\"text\":\"%s\",\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",
+		completion_id, (long)time(NULL), model_name, escaped_content ? escaped_content : "",
+		(int)strlen(final_prompt)/4, (int)full_len/4, ((int)strlen(final_prompt) + (int)full_len)/4) >= 0) {
+		
+		http_json(fd, 200, response_json);
+		free(response_json);
+	} else {
+		http_error(fd, 500, "internal_error", "Out of memory");
+	}
+
+	free(escaped_content);
+	free(final_prompt);
+	cJSON_Delete(root);
+	return 1;
+}
+
+int
+handle_v1_models(socket_t fd, char *body __attribute__((unused)))
+{
+	char *model_name = *qllm_model_path ? qllm_model_path : "unknown";
+	char *escaped_model = json_escape(model_name);
+	char *response_json = NULL;
+
+	if (!escaped_model) {
+		http_json(fd, 500, "{\"error\":{\"message\":\"Out of memory\",\"type\":\"internal_error\"}}");
+		return 1;
+	}
+	
+	if (asprintf(&response_json,
+		"{\"object\":\"list\",\"data\":[{\"id\":\"%s\",\"object\":\"model\",\"created\":%ld,\"owned_by\":\"local\"}]}",
+		escaped_model, (long)time(NULL)) < 0) {
+		free(escaped_model);
+		http_json(fd, 500, "{\"error\":{\"message\":\"Out of memory\",\"type\":\"internal_error\"}}");
+		return 1;
+	}
+
+	http_json(fd, 200, response_json);
+	free(response_json);
+	free(escaped_model);
+	return 1;
+}
+
+int
+handle_v1_chat_completions(socket_t fd, char *body)
+{
+	/* Force context initialization */
+	fdis[fd].ctx = general.ctx;
+	
+	cJSON *root = NULL;
+	cJSON *messages = NULL;
+	cJSON *tools = NULL;
+	cJSON *stop = NULL;
+	cJSON *stream_val = NULL;
+	cJSON *model_val = NULL;
+	char *formatted_prompt = NULL;
+	int stream = 0;
+	char *model_id = NULL;
+	char completion_id[64];
+	
+	snprintf(completion_id, sizeof(completion_id), "chatcmpl-%ld", (long)time(NULL));
+	
+	if (!body || !*body) {
+		http_error(fd, 400, "invalid_request_error", "Missing request body");
+		return 1;
+	}
+	
+	/* Parse JSON */
+	root = cJSON_Parse(body);
+	if (!root) {
+		http_error(fd, 400, "invalid_request_error", "Invalid JSON");
+		return 1;
+	}
+	
+	/* Extract messages array */
+	messages = cJSON_GetObjectItem(root, "messages");
+	if (!messages || !cJSON_IsArray(messages)) {
+		http_error(fd, 400, "invalid_request_error", "messages must be an array");
+		cJSON_Delete(root);
+		return 1;
+	}
+	
+	/* Extract stream flag (optional, default false) */
+	stream_val = cJSON_GetObjectItem(root, "stream");
+	if (stream_val && cJSON_IsBool(stream_val)) {
+		stream = cJSON_IsTrue(stream_val);
+	}
+
+	/* Extract stream_options - ignored for now as we always send usage */
+	cJSON_GetObjectItem(root, "stream_options");
+
+	
+	/* Extract model (optional) */
+	model_val = cJSON_GetObjectItem(root, "model");
+	if (model_val && cJSON_IsString(model_val)) {
+		model_id = model_val->valuestring;
+	}
+
+	/* Extract tools (optional, OpenAI/OpenCode-compatible) */
+	tools = cJSON_GetObjectItem(root, "tools");
+	
+	/* Extract stop sequences (optional) */
+	stop = cJSON_GetObjectItem(root, "stop");
+	if (stop && cJSON_IsString(stop)) {
+		/* Convert single string stop to array for internal consistency */
+		cJSON *arr = cJSON_CreateArray();
+		cJSON_AddItemToArray(arr, cJSON_CreateString(stop->valuestring));
+		cJSON_ReplaceItemInObject(root, "stop", arr);
+		stop = arr;
+	}
+	
+	/* Format conversation - truncate system if it exceeds context budget
+	 * Character budget is roughly 2x context size tokens */
+	int max_sys = calculate_max_system(messages, tools, stream);
+	formatted_prompt = format_conversation(messages, tools, model_template, 0, max_sys);
+	if (!formatted_prompt) {
+		http_error(fd, 500, "internal_error", "Failed to format conversation");
+		cJSON_Delete(root);
+		return 1;
+	}
+	
+	if (stream) {
+		/* Send streaming response in SSE format */
+		http_sse_start(fd);
+		
+		/* Send start */
+		oai_stream_role(fd, completion_id);
+		
+		/* Initialize fdi with shared context */
+		fdi_init(&fdis[fd], fd);
+		
+		/* Apply isolated grammar sampler if tools are present to ensure valid tool calls */
+		if (tools && cJSON_IsArray(tools) && cJSON_GetArraySize(tools) > 0) {
+			fdis[fd].sampler = qllm_sampler_create(fdis[fd].ctx, &cfg);
+			if (fdis[fd].sampler) {
+				qllm_sampler_add_grammar(fdis[fd].ctx, fdis[fd].sampler, tool_call_grammar);
+			}
+		}
+
+		/* Stream the response */
+		fdi_t *fdi = &fdis[fd];
+		char buf[4096];
+		char generated[BUFSIZ * 16];
+		size_t generated_len = 0;
+		int ret;
+		int step;
+		int max_gen = 512;
+		int completion_tokens = 0;
+
+		generated[0] = '\0';
+		
+		qllm_anchor_start(fdi->ctx);
+		if (qllm_prime(fdi->ctx, formatted_prompt) < 0) {
+			ndc_writef(fd, "data: {\"error\":\"Generation failed\"}\n\n");
+			ndc_writef(fd, "data: [DONE]\n\n");
+			free(formatted_prompt);
+			cJSON_Delete(root);
+			ndc_close(fd);
+			return 1;
+		}
+		qllm_anchor_end(fdi->ctx);
+		
+		for (step = 0; step < max_gen; step++) {
+			ret = qllm_next(fdi->ctx, fdi->sampler, buf, sizeof(buf));
+			if (ret <= 0)
+				break;
+			
+			completion_tokens++;
+
+			/* Check for delimiter */
+			char *delim = memchr(buf, delimiter, ret);
+			if (delim) {
+				*delim = '\0';
+				ret = delim - buf;
+			}
+			
+			if (ret > 0) {
+				size_t copy_len = (size_t)ret;
+				if (copy_len > sizeof(generated) - generated_len - 1)
+					copy_len = sizeof(generated) - generated_len - 1;
+				if (copy_len) {
+					memcpy(generated + generated_len, buf, copy_len);
+					generated_len += copy_len;
+					generated[generated_len] = '\0';
+				}
+
+				oai_stream_content(fd, completion_id, buf);
+			}
+			
+			if (delim || check_stop_sequences(generated, stop))
+				break;
+		}
+		
+		tool_call_t tool_call;
+		int has_tool_call = parse_tool_call(generated, &tool_call);
+		if (has_tool_call)
+			oai_stream_tool_call(fd, completion_id, &tool_call);
+
+		/* Send stop */
+		oai_stream_stop(fd, completion_id, has_tool_call ? "tool_calls" : "stop");
+
+		/* Final usage chunk - always send for compatibility */
+		int prompt_tokens = (int)strlen(formatted_prompt) / 4;
+		ndc_writef(fd, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}\n\n",
+			completion_id, prompt_tokens, completion_tokens, prompt_tokens + completion_tokens);
+
+		ndc_writef(fd, "data: [DONE]\n\n");
+
+		tool_call_free(&tool_call);
+		ndc_close(fd);
+		
+	} else {
+		/* Non-streaming response */
+		/* Initialize fdi with shared context */
+		fdi_init(&fdis[fd], fd);
+		
+		/* Apply isolated grammar sampler if tools are present */
+		if (tools && cJSON_IsArray(tools) && cJSON_GetArraySize(tools) > 0) {
+			fdis[fd].sampler = qllm_sampler_create(fdis[fd].ctx, &cfg);
+			if (fdis[fd].sampler) {
+				qllm_sampler_add_grammar(fdis[fd].ctx, fdis[fd].sampler, tool_call_grammar);
+			}
+		}
+
+		if (!fdis[fd].ctx) {
+			fprintf(stderr, "DEBUG: fdi ctx is NULL after fdi_init!\n");
+			fflush(stderr);
+			http_error(fd, 500, "internal_error", "Context not initialized");
+			free(formatted_prompt);
+			cJSON_Delete(root);
+			return 1;
+		}
+		
+		/* Generate response */
+		fdi_t *fdi = &fdis[fd];
+		char buf[4096];
+		char full_response[BUFSIZ * 16];
+		size_t full_len = 0;
+		int ret;
+		int step;
+		int max_gen = 512;
+
+		full_response[0] = '\0';
+		
+		qllm_anchor_start(fdi->ctx);
+		if (qllm_prime(fdi->ctx, formatted_prompt) < 0) {
+			http_error(fd, 500, "internal_error", "Generation failed");
+			free(formatted_prompt);
+			cJSON_Delete(root);
+			return 1;
+		}
+		qllm_anchor_end(fdi->ctx);
+		
+		for (step = 0; step < max_gen; step++) {
+			ret = qllm_next(fdi->ctx, fdi->sampler, buf, sizeof(buf));
+			if (ret <= 0)
+				break;
+			
+			/* Check for delimiter */
+			char *delim = memchr(buf, delimiter, ret);
+			if (delim) {
+				*delim = '\0';
+				ret = delim - buf;
+			}
+			
+			if (ret > 0) {
+				size_t copy_len = (size_t)ret;
+				if (copy_len > sizeof(full_response) - full_len - 1)
+					copy_len = sizeof(full_response) - full_len - 1;
+				if (copy_len) {
+					memcpy(full_response + full_len, buf, copy_len);
+					full_len += copy_len;
+					full_response[full_len] = '\0';
+				}
+			}
+			
+			if (delim)
+				break;
+
+			if (check_stop_sequences(full_response, stop)) {
+				break;
+			}
+		}
+		
+		tool_call_t tool_call;
+		int has_tool_call = parse_tool_call(full_response, &tool_call);
+		char *model_name = model_id ? model_id : (*qllm_model_path ? qllm_model_path : "unknown");
+		char *response_json = NULL;
+		int prompt_tokens = (int)strlen(formatted_prompt) / 4;
+		int completion_tokens = (int)full_len / 4;
+		
+		response_json = oai_completion_json(
+			completion_id,
+			model_name,
+			has_tool_call ? tool_call.content : full_response,
+			has_tool_call ? &tool_call : NULL,
+			prompt_tokens,
+			completion_tokens);
+		tool_call_free(&tool_call);
+
+		if (!response_json) {
+			http_error(fd, 500, "internal_error", "Out of memory");
+			free(formatted_prompt);
+			cJSON_Delete(root);
+			return 1;
+		}
+		
+		http_json(fd, 200, response_json);
+		free(response_json);
+	}
+	
+	free(formatted_prompt);
+	cJSON_Delete(root);
+	return 1;
 }
 
 void
@@ -925,7 +1742,8 @@ do_MESSAGES(int fd, int argc, char *argv[])
 	tools = cJSON_GetObjectItem(root, "tools");
 	
 	/* Format conversation (with tools if present) */
-	formatted_prompt = format_conversation(messages, tools, model_template, 0);
+	int max_sys = calculate_max_system(messages, tools, stream);
+	formatted_prompt = format_conversation(messages, tools, model_template, 0, max_sys);
 	if (!formatted_prompt) {
 		ndc_writef(fd, "{\"error\":\"Failed to format conversation\"}%c\n", delimiter);
 		cJSON_Delete(root);
@@ -968,7 +1786,7 @@ do_INFO(int fd, int argc __attribute__((unused)), char *argv[] __attribute__((un
 }
 
 static inline void
-fdi_init(fdi_t *fdi)
+fdi_init(fdi_t *fdi, int fd)
 {
 	/* Use the shared context instead of creating a new one */
 	/* This avoids the Vulkan multi-context crash */
@@ -976,8 +1794,15 @@ fdi_init(fdi_t *fdi)
 	
 	if (!fdi->ctx) {
 		qsyslog(QLOG_ERR, "Shared context is NULL\n");
+	} else {
+		uint32_t seq_id = 0;
+
+		if (cfg.n_contexts > 1)
+			seq_id = (uint32_t)(fd % cfg.n_contexts);
+		qllm_set_seq(fdi->ctx, seq_id);
 	}
 
+	fdi->sampler = NULL;
 	fdi->queue.tail = 0;
 	reset_fdi(fdi);
 }
@@ -985,7 +1810,7 @@ fdi_init(fdi_t *fdi)
 void
 do_CHAT(int fd, int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 {
-	fdi_init(&fdis[fd]);
+	fdi_init(&fdis[fd], fd);
 }
 
 struct cmd_slot cmds[] = {
@@ -1010,11 +1835,17 @@ struct cmd_slot cmds[] = {
 	}
 };
 
+#ifndef MOCK_BUILD
 int
+__attribute__((used))
 ndc_accept(int fd)
 {
+	fprintf(stderr, "DEBUG ndc_accept: fd=%d\n", fd);
+	fflush(stderr);
 #if FEAT_GENERAL
 	fdis[fd].ctx = general.ctx;
+	fprintf(stderr, "DEBUG ndc_accept: ctx=%p general.ctx=%p\n", fdis[fd].ctx, general.ctx);
+	fflush(stderr);
 #else
 	reset_fdi(&fdis[fd]);
 #endif
@@ -1029,9 +1860,14 @@ ndc_disconnect(int fd __attribute__((unused)))
 	if (fdi->ctx && fdi->ctx != general.ctx)
 		qllm_free(fdi->ctx);
 
+	if (fdi->sampler)
+		qllm_sampler_free(fdi->sampler);
+
 	fdi->ctx = NULL;
+	fdi->sampler = NULL;
 	reset_fdi(fdi);
 }
+#endif
 
 static void
 usage(char *prog)
@@ -1045,8 +1881,8 @@ usage(char *prog)
 	fprintf(stderr, "        -p PORT   specify server port (defaults to 4242)\n");
 	fprintf(stderr, "        -d        don't detach\n");
 	fprintf(stderr, "        -r        root multiplex mode\n");
-	fprintf(stderr, "        -c SIZE   specify n_ctx (default 2048)\n");
-	fprintf(stderr, "        -n NUM    specify an estimation of concurrent sessions (default 1)\n");
+	fprintf(stderr, "        -c SIZE   specify n_ctx (default auto-detect)\n");
+	fprintf(stderr, "        -n NUM    specify max concurrent sequences (default 1)\n");
 	fprintf(stderr, "        -S PROMPT set system prompt for all conversations\n");
     fprintf(stderr, "        -g LAYERS specify max GPU layers (0=auto, default 0)\n");
 	fprintf(stderr, "        -?        display this message.\n");
@@ -1078,6 +1914,18 @@ setup(const char *model_path)
 		break;
 	}
 
+	/* Initialize FIM tokens */
+	if (model_template == TEMPLATE_CHATML) {
+		fim_prefix = "<|fim_prefix|>";
+		fim_suffix = "<|fim_suffix|>";
+		fim_middle = "<|fim_middle|>";
+	} else {
+		/* Default/Llama-style FIM tokens */
+		fim_prefix = "<PRE>";
+		fim_suffix = "<SUF>";
+		fim_middle = "<MID>";
+	}
+
 	/* Create a SINGLE shared context that all connections will use */
 	/* This avoids the Vulkan multi-context issue */
 	fprintf(stderr, "qllmd: Creating shared context\n");
@@ -1086,12 +1934,14 @@ setup(const char *model_path)
 		fprintf(stderr, "qllmd: FATAL - Failed to create shared context\n");
 		exit(1);
 	}
-	fprintf(stderr, "qllmd: Shared context created successfully\n");
+	cfg.n_ctx = qllm_n_ctx(general.ctx);
+	fprintf(stderr, "qllmd: Shared context created successfully (n_ctx=%d)\n", cfg.n_ctx);
 
 	crb_len = (size_t)ndc_mmap(&crb, "crb.txt");
 	(void)crb_len;
 }
 
+#ifndef MOCK_BUILD
 int
 main(int argc, char *argv[])
 {
@@ -1197,6 +2047,13 @@ main(int argc, char *argv[])
 	ndc_register("messages", do_MESSAGES, CF_NOAUTH | CF_NOTRIM);
 	ndc_register("info", do_INFO, CF_NOAUTH | CF_NOTRIM);
 
+	/* Register OpenAI-compatible HTTP handlers */
+	/* Format is METHOD:path (e.g., GET:/health, POST:/v1/chat/completions) */
+	ndc_register_handler("GET:/v1/models", handle_v1_models);
+	ndc_register_handler("POST:/v1/chat/completions", handle_v1_chat_completions);
+	ndc_register_handler("POST:/v1/completions", handle_v1_completions);
+	ndc_register_handler("GET:/health", handle_health);
+
 	setup(arg_model);
 
 	ret = ndc_main();
@@ -1206,3 +2063,4 @@ main(int argc, char *argv[])
 
 	return ret;
 }
+#endif

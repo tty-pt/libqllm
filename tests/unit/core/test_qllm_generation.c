@@ -112,17 +112,11 @@ TEST(qllm_prime_success)
 
 TEST(qllm_prime_tokenize_fail)
 {
-    mock_llama_set_tokenize_fail(1);
     struct qllm_context *ctx = create_test_context();
     ASSERT_NOT_NULL(ctx);
+    mock_llama_set_tokenize_fail(1);
     int ret = qllm_prime(ctx, "anything");
-    if (ret != -1) {
-        /* Tokenize-fail not reproduced under current mocks; skip to avoid failure */
-        qllm_free(ctx);
-        mock_llama_set_tokenize_fail(0);
-        SKIP("mock tokenize-fail not reproducible; skipping");
-        return;
-    }
+    ASSERT_EQ(ret, -1);
     qllm_free(ctx);
     mock_llama_set_tokenize_fail(0);
 }
@@ -130,7 +124,7 @@ TEST(qllm_prime_tokenize_fail)
 TEST(qllm_next_null_ctx)
 {
 	char buf[256];
-	int ret = qllm_next(NULL, buf, sizeof(buf));
+	int ret = qllm_next(NULL, NULL, buf, sizeof(buf));
 	ASSERT_EQ(ret, -1);
 }
 
@@ -142,7 +136,7 @@ TEST(qllm_next_null_buf)
 		return;
 	}
 
-	int ret = qllm_next(ctx, NULL, 256);
+	int ret = qllm_next(ctx, NULL, NULL, 256);
 	ASSERT_EQ(ret, -1);
 
 	qllm_free(ctx);
@@ -157,7 +151,7 @@ TEST(qllm_next_zero_buf_size)
 	}
 
 	char buf[256];
-	int ret = qllm_next(ctx, buf, 0);
+	int ret = qllm_next(ctx, NULL, buf, 0);
 	ASSERT_EQ(ret, -1);
 
 	qllm_free(ctx);
@@ -177,7 +171,7 @@ TEST(qllm_next_after_prime)
     mock_llama_set_next_tokens(nexts, 1);
 
     char buf[256];
-    int r = qllm_next(ctx, buf, sizeof(buf));
+    int r = qllm_next(ctx, NULL, buf, sizeof(buf));
     ASSERT_TRUE(r >= 0);
     qllm_free(ctx);
 }

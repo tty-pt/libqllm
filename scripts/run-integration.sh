@@ -17,14 +17,12 @@ SERVE_PID_FILE="$LOGDIR/qllm-serve.pid"
 MODEL_PATH="${MODEL:-}"
 
 find_default_model() {
-    # Try a few likely places for a gguf model in the user's cache or repo
+    # Try a few likely places for a non-empty gguf model in the user's cache or repo
     local m
-    m=$(ls -d "$HOME/.cache/huggingface/hub/models--"*/snapshots/*/*.gguf 2>/dev/null | head -n1 || true)
-    if [ -n "$m" ]; then echo "$m"; return 0; fi
-    m=$(ls -d "$HOME/.cache/huggingface/hub/models--"*/*.gguf 2>/dev/null | head -n1 || true)
+    m=$(find "$HOME/.cache/huggingface/hub" -name "*.gguf" -type f -size +1M 2>/dev/null | head -n1 || true)
     if [ -n "$m" ]; then echo "$m"; return 0; fi
     # fallback: search repo for a named Phi-3 snapshot (best-effort)
-    m=$(find "$ROOT" -maxdepth 6 -type f -name "*Phi-3*.gguf" 2>/dev/null | head -n1 || true)
+    m=$(find "$ROOT" -maxdepth 6 -type f -name "*Phi-3*.gguf" -size +1M 2>/dev/null | head -n1 || true)
     if [ -n "$m" ]; then echo "$m"; return 0; fi
     return 1
 }

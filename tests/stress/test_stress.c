@@ -22,8 +22,13 @@ static struct qllm_context *create_stress_context(void)
 
 TEST(stress_create_destroy_cycle)
 {
-    /* Flaky under current mocks; skip to keep CI green until root cause fixed */
-    SKIP("Flaky under current mocks: skip stress_create_destroy_cycle");
+	int i;
+
+	for (i = 0; i < STRESS_ITERATIONS; i++) {
+		struct qllm_context *ctx = create_stress_context();
+		ASSERT_NOT_NULL(ctx);
+		qllm_free(ctx);
+	}
 }
 
 TEST(stress_prime_cycle)

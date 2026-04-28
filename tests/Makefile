@@ -1,5 +1,5 @@
 CC := gcc
-CFLAGS := -g -Wall -Wextra -Wno-unused-parameter -I./framework -I./mocks -I../include -DMOCK_BUILD
+CFLAGS := -g -Wall -Wextra -Wno-unused-parameter -I./framework -I./mocks/ttypt -I./mocks -I../include -DMOCK_BUILD
 LDFLAGS := -lpthread -lm
 
 TEST_SRC := $(wildcard unit/core/*.c unit/daemon/*.c unit/backend/*.c edge/*.c stress/*.c)
@@ -7,11 +7,11 @@ TEST_SRC := $(wildcard unit/core/*.c unit/daemon/*.c unit/backend/*.c edge/*.c s
 
 FRAMEWORK_SRC := framework/test_utils.c framework/mock_registry.c
 MOCK_SRC := mocks/llama_mock.c mocks/gguf_mock.c mocks/qmap_mock.c mocks/ndc_mock.c mocks/vulkan_mock.c
-LIB_SRC := libqllm.c
+LIB_SRC := libqllm.o qllmd.o cJSON.o
 MAIN_SRC := test_main.c
 
-ALL_SRC := $(MAIN_SRC) $(FRAMEWORK_SRC) $(MOCK_SRC) $(LIB_SRC) $(TEST_SRC)
-ALL_OBJ := $(ALL_SRC:.c=.o)
+ALL_SRC := $(MAIN_SRC) $(FRAMEWORK_SRC) $(MOCK_SRC) $(TEST_SRC)
+ALL_OBJ := $(ALL_SRC:.c=.o) $(LIB_SRC)
 
 TARGET := test_runner
 
@@ -27,6 +27,12 @@ $(TARGET): $(ALL_OBJ)
 
 libqllm.o: ../src/libqllm.c
 	$(CC) $(CFLAGS) -I./mocks -c -o $@ $<
+
+qllmd.o: ../src/qllmd.c
+	$(CC) $(CFLAGS) -I./mocks -I../third_party/cjson -I../ndc/include -I../ndx/include -c -o $@ $<
+
+cJSON.o: ../third_party/cjson/cJSON.c
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 run: $(TARGET)
 	./$(TARGET)

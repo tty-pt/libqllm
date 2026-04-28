@@ -5,7 +5,7 @@
       "npm": "@ai-sdk/openai-compatible",
       "name": "libqllm (local)",
       "options": {
-        "baseURL": "http://127.0.0.1:8001/v1",
+        "baseURL": "http://127.0.0.1:4242/v1",
         "apiKey": "dummy"
       },
       "models": {
@@ -13,16 +13,9 @@
           "name": "qwen2.5-coder-3b-instruct-q4_k_m",
           "limit": {
             "context": 4096,
-            "output": 2048
+            "output": 1024
           }
-	},
-        "phi-3": {
-          "name": "Phi-3-mini-4k-instruct (local)",
-          "limit": {
-            "context": 1024,
-            "output": 2048
-          }
-        }
+	}
       }
     }
   }

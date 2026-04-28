@@ -23,6 +23,7 @@ struct qllm_context {
 	struct llama_model	*model;
 	struct llama_context	*ctx;
 	struct llama_sampler	*sampler;
+	struct llama_sampler	*grammar_sampler;
 	struct llama_sampler	*sampler_children[8];
 	int32_t			sampler_children_n;
 	struct llama_context_params params;
@@ -36,6 +37,7 @@ struct qllm_context {
 
 	llama_token		*token_buf;
 	llama_seq_id		*seq_ids;
+	llama_seq_id		 current_seq;
 
 	
 	int32_t gen_tokens;
@@ -114,7 +116,6 @@ qllm_decode_tokens(struct qllm_context *qctx,
 		   int32_t n_tokens)
 {
 	struct llama_batch batch;
-	static llama_seq_id seq0 = 0;
 	int32_t i;
 
 	if (!qctx || !qctx->ctx || !tokens || n_tokens <= 0) {
@@ -132,8 +133,7 @@ qllm_decode_tokens(struct qllm_context *qctx,
     for (i = 0; i < n_tokens; ++i) {
         batch.token[i] = tokens[i];
         batch.n_seq_id[i] = 1;
-        /* qctx->seq_ids[i] = 0; */
-        batch.seq_id[i] = &seq0;
+        batch.seq_id[i] = &qctx->current_seq;
         batch.logits[i] = (i == n_tokens - 1);
     }
 
@@ -157,13 +157,14 @@ extern void
 qllm_backend_mem_check(int gpu, size_t *free_b, size_t *total_b);
 
 static void
-get_model_dims(const char *path, int *n_layers, int *n_embd)
+get_model_dims(const char *path, int *n_layers, int *n_embd, int *n_ctx)
 {
 	struct gguf_init_params ip = { .no_alloc = true };
 	struct gguf_context *ctx;
 
 	*n_layers = 0;
 	*n_embd = 0;
+	*n_ctx = 0;
 
 	ctx = gguf_init_from_file(path, ip);
 	if (!ctx)
@@ -215,6 +216,23 @@ get_model_dims(const char *path, int *n_layers, int *n_embd)
 		case GGUF_TYPE_INT32:  *n_embd = gguf_get_val_i32(ctx, emb_key); break;
 		case GGUF_TYPE_UINT64: *n_embd = (int)gguf_get_val_u64(ctx, emb_key); break;
 		case GGUF_TYPE_INT64:  *n_embd = (int)gguf_get_val_i64(ctx, emb_key); break;
+		default: break;
+		}
+	}
+
+	snprintf(key, sizeof(key), "%s.context_length", arch);
+	int ctx_key = gguf_find_key(ctx, key);
+	if (ctx_key >= 0) {
+		enum gguf_type type = gguf_get_kv_type(ctx, ctx_key);
+		switch (type) {
+		case GGUF_TYPE_UINT8:  *n_ctx = gguf_get_val_u8(ctx, ctx_key);  break;
+		case GGUF_TYPE_INT8:   *n_ctx = gguf_get_val_i8(ctx, ctx_key);  break;
+		case GGUF_TYPE_UINT16: *n_ctx = gguf_get_val_u16(ctx, ctx_key); break;
+		case GGUF_TYPE_INT16:  *n_ctx = gguf_get_val_i16(ctx, ctx_key); break;
+		case GGUF_TYPE_UINT32: *n_ctx = gguf_get_val_u32(ctx, ctx_key); break;
+		case GGUF_TYPE_INT32:  *n_ctx = gguf_get_val_i32(ctx, ctx_key); break;
+		case GGUF_TYPE_UINT64: *n_ctx = (int)gguf_get_val_u64(ctx, ctx_key); break;
+		case GGUF_TYPE_INT64:  *n_ctx = (int)gguf_get_val_i64(ctx, ctx_key); break;
 		default: break;
 		}
 	}
@@ -362,10 +380,8 @@ struct llama_model *model_load(
 {
 	struct llama_model_params model_params;
 	struct llama_model *model;
-	int n_layers = 0, n_embd = 0;
+	int n_layers = 0, n_embd = 0, n_ctx_detected = 0;
 	int ngl = 0;
-
-	(void)n_ctx;
 
     /* Check cache for existing model. qmap stores a pointer-sized value;
      * we store a pointer to a heap-allocated model_cache_entry. qmap_get
@@ -388,7 +404,7 @@ struct llama_model *model_load(
 		n_contexts = 1;
 
 	/* Get model dimensions from GGUF metadata (fast, no model load) */
-	get_model_dims(path, &n_layers, &n_embd);
+	get_model_dims(path, &n_layers, &n_embd, &n_ctx_detected);
 
     /* Calculate optimal GPU layers - auto mode if n_gpu_layers is 0 */
     if (n_gpu_layers == 0) {
@@ -596,23 +612,27 @@ qllm_create(const struct qllm_config *cfg)
 {
 	struct qllm_context *qctx;
 	struct llama_context_params ctx_params;
-	struct llama_sampler_chain_params chain_params;
 	int32_t n_threads;
 
 	if (!cfg || !cfg->model_path)
 		return NULL;
 
 	ctx_params = llama_context_default_params();
-	chain_params = llama_sampler_chain_default_params();
 
 	if (cfg->n_ctx > 0)
 		ctx_params.n_ctx = (uint32_t) cfg->n_ctx;
-	else
-		ctx_params.n_ctx = 2048; /* Increased default from 512 to 2048 */
+	else {
+		int nl = 0, ne = 0, nc = 0;
+		get_model_dims(cfg->model_path, &nl, &ne, &nc);
+		if (nc > 0)
+			ctx_params.n_ctx = (uint32_t) nc;
+		else
+			ctx_params.n_ctx = 2048; /* Fallback */
+	}
 
 	ctx_params.n_batch = ctx_params.n_ctx;
 	ctx_params.n_ubatch = 0;
-	ctx_params.n_seq_max = 1;
+	ctx_params.n_seq_max = cfg->n_contexts > 0 ? (uint32_t)cfg->n_contexts : 1;
 
 	/* Enable embeddings and mean pooling only if requested.
 	 * This is required for qllm_embed() but not for text generation.
@@ -675,80 +695,11 @@ qllm_create(const struct qllm_config *cfg)
 /* Debug prints used only during mock/test builds were helpful while
  * iterating, but they are noisy. Remove them to keep test output clean. */
 
-    qctx->sampler = llama_sampler_chain_init(chain_params);
-    if (!qctx->sampler)
-        goto fail;
+	qctx->magic = QLLM_MAGIC;
 
-    /* Add child samplers and record them so we can free their ctx
-     * allocations later (the mock sampler free does not call iface->free). */
-    qctx->sampler_children_n = 0;
-
-    {
-        struct llama_sampler *s = llama_sampler_init_eos_bias(qctx);
-        if (s) {
-            llama_sampler_chain_add(qctx->sampler, s);
-            if (qctx->sampler_children_n < (int) (sizeof(qctx->sampler_children)/sizeof(qctx->sampler_children[0])))
-                qctx->sampler_children[qctx->sampler_children_n++] = s;
-        }
-    }
-
-    {
-        /* Use configured repeat penalty parameters or defaults */
-        int32_t last_n = (cfg->repeat_last_n > 0) ? cfg->repeat_last_n : 64;
-        float repeat = (cfg->repeat_penalty > 0.0f) ? cfg->repeat_penalty : 1.1f;
-        
-        struct llama_sampler *s = llama_sampler_init_penalties(
-            last_n,   /* last_n */
-            repeat,   /* repeat */
-            0.0f,     /* freq */
-            0.0f      /* present */
-        );
-        if (s) {
-            llama_sampler_chain_add(qctx->sampler, s);
-            if (qctx->sampler_children_n < (int) (sizeof(qctx->sampler_children)/sizeof(qctx->sampler_children[0])))
-                qctx->sampler_children[qctx->sampler_children_n++] = s;
-        }
-    }
-
-    /* Add top-k sampler if configured */
-    if (cfg->top_k > 0) {
-        struct llama_sampler *s = llama_sampler_init_top_k(cfg->top_k);
-        if (s) {
-            llama_sampler_chain_add(qctx->sampler, s);
-            if (qctx->sampler_children_n < (int) (sizeof(qctx->sampler_children)/sizeof(qctx->sampler_children[0])))
-                qctx->sampler_children[qctx->sampler_children_n++] = s;
-        }
-    }
-
-    /* Add top-p sampler if configured */
-    if (cfg->top_p > 0.0f && cfg->top_p < 1.0f) {
-        struct llama_sampler *s = llama_sampler_init_top_p(cfg->top_p, 1);
-        if (s) {
-            llama_sampler_chain_add(qctx->sampler, s);
-            if (qctx->sampler_children_n < (int) (sizeof(qctx->sampler_children)/sizeof(qctx->sampler_children[0])))
-                qctx->sampler_children[qctx->sampler_children_n++] = s;
-        }
-    }
-
-    /* Add temperature sampler */
-    {
-        float temp = (cfg->temperature > 0.0f) ? cfg->temperature : 0.7f;
-        struct llama_sampler *s = llama_sampler_init_temp(temp);
-        if (s) {
-            llama_sampler_chain_add(qctx->sampler, s);
-            if (qctx->sampler_children_n < (int) (sizeof(qctx->sampler_children)/sizeof(qctx->sampler_children[0])))
-                qctx->sampler_children[qctx->sampler_children_n++] = s;
-        }
-    }
-
-    {
-        struct llama_sampler *s = llama_sampler_init_dist(0);
-        if (s) {
-            llama_sampler_chain_add(qctx->sampler, s);
-            if (qctx->sampler_children_n < (int) (sizeof(qctx->sampler_children)/sizeof(qctx->sampler_children[0])))
-                qctx->sampler_children[qctx->sampler_children_n++] = s;
-        }
-    }
+	qctx->sampler = qllm_sampler_create(qctx, cfg);
+	if (!qctx->sampler)
+		goto fail;
 
 	qctx->token_buf = calloc((size_t)qctx->max_tokens,
 	    sizeof(*qctx->token_buf));
@@ -760,8 +711,6 @@ qllm_create(const struct qllm_config *cfg)
 	qctx->gen_tokens   = 0;
 	qctx->eos_start    = 64;
 	qctx->eos_bias_max = 3.0f;
-
-	qctx->magic = QLLM_MAGIC;
 
 	return qctx;
 
@@ -849,9 +798,133 @@ qllm_free(struct qllm_context *qctx)
     free(qctx);
 }
 
+int
+qllm_n_ctx(struct qllm_context *qctx)
+{
+	if (!QLLM_VALID(qctx))
+		return 0;
+	return qctx->max_tokens;
+}
+
+struct llama_sampler *
+qllm_sampler_create(struct qllm_context *qctx, const struct qllm_config *cfg)
+{
+	struct llama_sampler_chain_params chain_params = llama_sampler_chain_default_params();
+	struct llama_sampler * sampler;
+
+	if (!QLLM_VALID(qctx))
+		return NULL;
+
+	sampler = llama_sampler_chain_init(chain_params);
+	if (!sampler)
+		return NULL;
+
+	/* Add child samplers */
+	{
+		struct llama_sampler *s = llama_sampler_init_eos_bias(qctx);
+		if (s) llama_sampler_chain_add(sampler, s);
+	}
+
+	{
+		int32_t last_n = (cfg && cfg->repeat_last_n > 0) ? cfg->repeat_last_n : 64;
+		float repeat = (cfg && cfg->repeat_penalty > 0.0f) ? cfg->repeat_penalty : 1.1f;
+		
+		struct llama_sampler *s = llama_sampler_init_penalties(last_n, repeat, 0.0f, 0.0f);
+		if (s) llama_sampler_chain_add(sampler, s);
+	}
+
+	if (cfg && cfg->top_k > 0) {
+		struct llama_sampler *s = llama_sampler_init_top_k(cfg->top_k);
+		if (s) llama_sampler_chain_add(sampler, s);
+	}
+
+	if (cfg && cfg->top_p > 0.0f && cfg->top_p < 1.0f) {
+		struct llama_sampler *s = llama_sampler_init_top_p(cfg->top_p, 1);
+		if (s) llama_sampler_chain_add(sampler, s);
+	}
+
+	{
+		float temp = (cfg && cfg->temperature > 0.0f) ? cfg->temperature : 0.7f;
+		struct llama_sampler *s = llama_sampler_init_temp(temp);
+		if (s) llama_sampler_chain_add(sampler, s);
+	}
+
+	{
+		struct llama_sampler *s = llama_sampler_init_dist(0);
+		if (s) llama_sampler_chain_add(sampler, s);
+	}
+
+	return sampler;
+}
+
+void
+qllm_sampler_free(struct llama_sampler *smpl)
+{
+	if (smpl)
+		llama_sampler_free(smpl);
+}
+
+int
+qllm_sampler_add_grammar(struct qllm_context *qctx,
+			 struct llama_sampler *sampler,
+			 const char *grammar_str)
+{
+	struct llama_sampler *gs;
+
+	if (!QLLM_VALID(qctx) || !sampler || !grammar_str)
+		return -1;
+
+	gs = llama_sampler_init_grammar(qctx->vocab, grammar_str, "root");
+	if (!gs)
+		return -1;
+
+	llama_sampler_chain_add(sampler, gs);
+	return 0;
+}
+
+void
+qllm_set_seq(struct qllm_context *qctx, uint32_t seq_id)
+{
+	if (!QLLM_VALID(qctx))
+		return;
+	qctx->current_seq = (llama_seq_id)seq_id;
+}
+
+int
+qllm_set_grammar(struct qllm_context *qctx, const char *grammar_str)
+{
+	if (!QLLM_VALID(qctx))
+		return -1;
+
+	/* Free existing grammar sampler if any */
+	if (qctx->grammar_sampler) {
+		/* We can't easily remove it from the chain if it's already there,
+		 * but llama_sampler_chain_add always appends. 
+		 * For simplicity, we just free it and the next sample will use the new one.
+		 * Actually, we should probably recreate the whole chain or use 
+		 * a dedicated grammar slot. 
+		 * In llama.cpp, adding multiple grammar samplers to a chain is usually not intended.
+		 */
+		llama_sampler_free(qctx->grammar_sampler);
+		qctx->grammar_sampler = NULL;
+	}
+
+	if (grammar_str) {
+		qctx->grammar_sampler = llama_sampler_init_grammar(qctx->vocab, grammar_str, "root");
+		if (!qctx->grammar_sampler)
+			return -1;
+		
+		/* Add to the end of the chain. */
+		llama_sampler_chain_add(qctx->sampler, qctx->grammar_sampler);
+	}
+
+	return 0;
+}
+
 /* Internal streaming helper: runs generation and calls cb() for each piece. */
 static int
 qllm_generate_stream_internal(struct qllm_context *qctx,
+			      struct llama_sampler *sampler,
 			      const char *prompt,
 			      qllm_token_cb cb,
 			      void *user)
@@ -862,6 +935,7 @@ qllm_generate_stream_internal(struct qllm_context *qctx,
 	int n_piece;
 	int32_t step;
 	const int32_t max_gen = qctx->max_tokens;
+	struct llama_sampler *smpl = sampler ? sampler : qctx->sampler;
 
 	if (!qctx || !prompt || !cb)
 		return -1;
@@ -886,8 +960,8 @@ qllm_generate_stream_internal(struct qllm_context *qctx,
 		return -1;
 
 	for (step = 0; step < max_gen; ++step) {
-		tok = llama_sampler_sample(qctx->sampler, qctx->ctx, -1);
-		llama_sampler_accept(qctx->sampler, tok);
+		tok = llama_sampler_sample(smpl, qctx->ctx, -1);
+		llama_sampler_accept(smpl, tok);
 
 #if defined(MOCK_BUILD)
         /* Debug: show sampled token to diagnose skipped-callback cases */
@@ -940,7 +1014,7 @@ qllm_generate_stream(struct qllm_context *qctx,
 	if (!QLLM_VALID(qctx) || !prompt || !cb)
 		return -1;
 
-	return qllm_generate_stream_internal(qctx, prompt, cb, user);
+	return qllm_generate_stream_internal(qctx, NULL, prompt, cb, user);
 }
 
 /* Accumulator used by qllm_generate() to build a string. */
@@ -996,6 +1070,7 @@ qllm_generate(struct qllm_context *qctx,
 	acc.len = 0;
 
 	ret = qllm_generate_stream_internal(qctx,
+					    NULL,
 					    prompt,
 					    qllm_accum_cb,
 					    &acc);
@@ -1097,19 +1172,24 @@ qllm_prime(struct qllm_context *qctx,
 
 int
 qllm_next(struct qllm_context *qctx,
+	  struct llama_sampler *sampler,
 	  char *out,
 	  size_t out_size)
 {
 	llama_token tok;
 	char piece[256];
 	int n_piece;
+	struct llama_sampler *smpl;
 
 	if (!QLLM_VALID(qctx) || !out || out_size == 0)
 		return -1;
 
+	smpl = sampler ? sampler : qctx->sampler;
+
+retry:
 	/* Sample one token */
-	tok = llama_sampler_sample(qctx->sampler, qctx->ctx, -1);
-	llama_sampler_accept(qctx->sampler, tok);
+	tok = llama_sampler_sample(smpl, qctx->ctx, -1);
+	llama_sampler_accept(smpl, tok);
 
 	if (tok == llama_vocab_eot(qctx->vocab)) {
 		qctx->token_buf[0] = tok;
@@ -1127,7 +1207,7 @@ qllm_next(struct qllm_context *qctx,
 	if (llama_vocab_is_control(qctx->vocab, tok)) {
 		qctx->token_buf[0] = tok;
 		qllm_decode_tokens(qctx, qctx->token_buf, 1);
-		return 1; // continua, mas nada foi escrito
+		goto retry;
 	}
 
 	/* Treat any EOG/EOS as end-of-generation */

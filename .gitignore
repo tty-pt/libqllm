@@ -4,3 +4,8 @@
 /third_party
 /bin
 /stage
+
+# Test binaries
+/tests/test_runner
+/tests/test_auto_ngl
+/tests/integration/__pycache__

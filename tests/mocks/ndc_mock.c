@@ -15,6 +15,13 @@ static struct {
 } _registered_cmds[32];
 static int _n_registered = 0;
 
+static int _last_status = 0;
+static struct {
+	char name[64];
+	char value[256];
+} _headers[16];
+static int _n_headers = 0;
+
 void
 mock_ndc_init(void)
 {
@@ -22,7 +29,10 @@ mock_ndc_init(void)
 	_capture_size = 0;
 	_capture_pos = 0;
 	_n_registered = 0;
+	_last_status = 0;
+	_n_headers = 0;
 	memset(_registered_cmds, 0, sizeof(_registered_cmds));
+	memset(_headers, 0, sizeof(_headers));
 }
 
 void
@@ -55,6 +65,22 @@ mock_ndc_reset_write_capture(void)
 	_capture_pos = 0;
 	if (_capture_buf && _capture_size > 0)
 		_capture_buf[0] = '\0';
+}
+
+int
+mock_ndc_get_last_status(void)
+{
+	return _last_status;
+}
+
+const char*
+mock_ndc_get_header(const char *name)
+{
+	for (int i = 0; i < _n_headers; i++) {
+		if (strcasecmp(_headers[i].name, name) == 0)
+			return _headers[i].value;
+	}
+	return NULL;
 }
 
 int
@@ -92,7 +118,7 @@ ndc_write(int fd, const void *buf, size_t len)
 int
 ndc_writef(int fd, const char *fmt, ...)
 {
-	char buf[4096];
+	char buf[8192];
 	va_list ap;
 	int n;
 
@@ -121,6 +147,36 @@ ndc_register(const char *name, void *cb, int flags)
 		_registered_cmds[_n_registered].flags = flags;
 		_n_registered++;
 	}
+}
+
+void
+ndc_register_handler(const char *path, ndc_http_handler handler)
+{
+	/* For mocks, we don't need to do much here unless we want to simulate routing */
+}
+
+void
+ndc_respond(socket_t fd, int code, const char *body)
+{
+	_last_status = code;
+	if (body) {
+		ndc_write(fd, body, strlen(body));
+	}
+}
+
+void
+ndc_header_set(socket_t fd, const char *name, const char *value)
+{
+	if (_n_headers < 16) {
+		strncpy(_headers[_n_headers].name, name, 63);
+		strncpy(_headers[_n_headers].value, value, 255);
+		_n_headers++;
+	}
+}
+
+void
+ndc_close(socket_t fd)
+{
 }
 
 size_t
