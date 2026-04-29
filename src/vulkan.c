@@ -58,10 +58,60 @@ vk_get_gpu(VkInstance inst, int index)
 	return dev;
 }
 
+static VkPhysicalDevice
+vk_get_best_gpu(VkInstance inst)
+{
+	uint32_t count = 0;
+	vkEnumeratePhysicalDevices(inst, &count, NULL);
+	if (count == 0)
+		return VK_NULL_HANDLE;
+
+	VkPhysicalDevice *list = malloc(sizeof(*list) * count);
+	vkEnumeratePhysicalDevices(inst, &count, list);
+
+	VkPhysicalDevice best_dev = list[0];
+	VkPhysicalDeviceProperties best_props;
+	vkGetPhysicalDeviceProperties(list[0], &best_props);
+
+	for (uint32_t i = 1; i < count; i++) {
+		VkPhysicalDeviceProperties props;
+		vkGetPhysicalDeviceProperties(list[i], &props);
+
+		/* Prefer discrete GPUs */
+		if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU &&
+		    best_props.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+			best_dev = list[i];
+			best_props = props;
+		} else if (props.deviceType == best_props.deviceType) {
+			/* If both are same type, prefer one with more VRAM.
+			 * We need to query memory properties for that. */
+			VkPhysicalDeviceMemoryProperties mem, best_mem;
+			vkGetPhysicalDeviceMemoryProperties(list[i], &mem);
+			vkGetPhysicalDeviceMemoryProperties(best_dev, &best_mem);
+
+			size_t vram = 0, best_vram = 0;
+			for (uint32_t j = 0; j < mem.memoryHeapCount; j++)
+				if (mem.memoryHeaps[j].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+					vram += mem.memoryHeaps[j].size;
+			for (uint32_t j = 0; j < best_mem.memoryHeapCount; j++)
+				if (best_mem.memoryHeaps[j].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+					best_vram += best_mem.memoryHeaps[j].size;
+			
+			if (vram > best_vram) {
+				best_dev = list[i];
+				best_props = props;
+			}
+		}
+	}
+
+	free(list);
+	return best_dev;
+}
+
 /*
  * This is the function you asked for.
  *
- * - gpu = GPU index (0 = first GPU)
+ * - gpu = GPU index (0 = first GPU, -1 = auto-detect best)
  * - free_b  = output: free VRAM in bytes (if available)
  * - total_b = output: total VRAM in bytes
  */
@@ -75,7 +125,12 @@ qllm_backend_mem_check(int gpu, size_t *free_b, size_t *total_b)
 	if (!inst)
 		return;
 
-	VkPhysicalDevice dev = vk_get_gpu(inst, gpu);
+	VkPhysicalDevice dev;
+	if (gpu == -1)
+		dev = vk_get_best_gpu(inst);
+	else
+		dev = vk_get_gpu(inst, gpu);
+
 	if (!dev) {
 		vkDestroyInstance(inst, NULL);
 		return;

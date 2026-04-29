@@ -157,7 +157,7 @@ extern void
 qllm_backend_mem_check(int gpu, size_t *free_b, size_t *total_b);
 
 static void
-get_model_dims(const char *path, int *n_layers, int *n_embd, int *n_ctx)
+get_model_dims(const char *path, int *n_layers, int *n_embd, int *n_ctx, int *n_head, int *n_kv_head)
 {
 	struct gguf_init_params ip = { .no_alloc = true };
 	struct gguf_context *ctx;
@@ -165,6 +165,8 @@ get_model_dims(const char *path, int *n_layers, int *n_embd, int *n_ctx)
 	*n_layers = 0;
 	*n_embd = 0;
 	*n_ctx = 0;
+	*n_head = 0;
+	*n_kv_head = 0;
 
 	ctx = gguf_init_from_file(path, ip);
 	if (!ctx)
@@ -220,6 +222,20 @@ get_model_dims(const char *path, int *n_layers, int *n_embd, int *n_ctx)
 		}
 	}
 
+	snprintf(key, sizeof(key), "%s.attention.head_count", arch);
+	int head_key = gguf_find_key(ctx, key);
+	if (head_key >= 0) {
+		*n_head = gguf_get_val_u32(ctx, head_key);
+	}
+
+	snprintf(key, sizeof(key), "%s.attention.head_count_kv", arch);
+	int kv_head_key = gguf_find_key(ctx, key);
+	if (kv_head_key >= 0) {
+		*n_kv_head = gguf_get_val_u32(ctx, kv_head_key);
+	} else {
+		*n_kv_head = *n_head; /* Default to MHA */
+	}
+
 	snprintf(key, sizeof(key), "%s.context_length", arch);
 	int ctx_key = gguf_find_key(ctx, key);
 	if (ctx_key >= 0) {
@@ -242,18 +258,15 @@ get_model_dims(const char *path, int *n_layers, int *n_embd, int *n_ctx)
 
 static int
 auto_ngl(const char *path, int gpu, uint32_t n_ctx, uint32_t max_offload_bytes,
-	 int n_layers, int n_embd, int n_contexts)
+	 int n_layers, int n_embd, int n_contexts, int n_head, int n_kv_head)
 {
 	size_t free_b, total_b;
 	struct gguf_init_params ip = { .no_alloc = true };
 	struct gguf_context *ctx;
 	size_t *layer_sizes;
 	size_t usable;
-	size_t kv_size_per_ctx;
+	size_t kv_per_layer_all_ctx;
 	size_t workspace_per_ctx;
-	size_t this_ctx_cost;
-	size_t per_other_ctx_cost = 0;
-	size_t other_ctx_cost = 0;
 	size_t system_overhead;
 	size_t reserve;
 	size_t used;
@@ -266,10 +279,16 @@ auto_ngl(const char *path, int gpu, uint32_t n_ctx, uint32_t max_offload_bytes,
 		n_contexts = 1;
 
 	qllm_backend_mem_check(gpu, &free_b, &total_b);
-	if (!total_b || !free_b)
+	if (!total_b)
 		return 0;
 
-	usable = free_b;
+	if (free_b > 0) {
+		usable = free_b;
+	} else {
+		/* Fallback: assume 75% of total VRAM is usable if budget extension is missing */
+		usable = total_b * 3 / 4;
+	}
+
 	if (!usable)
 		return 0;
 
@@ -322,34 +341,33 @@ auto_ngl(const char *path, int gpu, uint32_t n_ctx, uint32_t max_offload_bytes,
 		if (layer_sizes[i] > largest_layer)
 			largest_layer = layer_sizes[i];
 
-	workspace_per_ctx = largest_layer + (64 * 1024 * 1024);
+	/* Compute buffer cost: roughly scales with n_ubatch * n_embd. 
+	 * n_ubatch is capped at 512 in model_load() for consistency. */
+	uint32_t eff_ubatch = n_ctx > 512 ? 512 : n_ctx;
+	workspace_per_ctx = largest_layer + ((size_t)eff_ubatch * (size_t)n_embd * 4ULL);
 
-	/* 2 * n_ctx * n_embd * n_layers * sizeof(f16) == 4 * n_ctx * n_embd * n_layers */
-	kv_size_per_ctx =
-	    (size_t)n_ctx *
-	    (size_t)n_embd *
-	    25ULL *
-	    (size_t)n_layers;
-
-	system_overhead = kv_size_per_ctx / 10;
-
-	this_ctx_cost = kv_size_per_ctx + workspace_per_ctx;
-
-	if (n_contexts > 1) {
-		per_other_ctx_cost = this_ctx_cost + (this_ctx_cost >> 1);
-		other_ctx_cost = per_other_ctx_cost * (size_t)(n_contexts - 1);
+	/* Calculate KV cache cost per layer, accounting for GQA (n_kv_head / n_head) */
+	size_t n_embd_kv = (size_t)n_embd;
+	if (n_head > 0 && n_kv_head > 0 && n_kv_head < n_head) {
+		n_embd_kv = (size_t)n_embd * (size_t)n_kv_head / (size_t)n_head;
 	}
+	
+	/* 2 bytes for K + 2 bytes for V = 4 bytes per token per layer */
+	kv_per_layer_all_ctx = (size_t)n_ctx * n_embd_kv * 4ULL * (size_t)n_contexts;
 
-	/* reserva fixa para driver/SO */
-	reserve = 128 * 1024 * 1024ULL;
+	/* 5% overhead for system/fragmentation */
+	system_overhead = (kv_per_layer_all_ctx * (size_t)n_layers) / 20;
 
-	if (usable <= reserve + this_ctx_cost + other_ctx_cost + system_overhead) {
+	/* Fixed reserve for driver/OS */
+	reserve = 64 * 1024 * 1024ULL;
+
+	if (usable <= reserve + workspace_per_ctx + system_overhead) {
 		free(layer_sizes);
 		return 0;
 	}
 
 	usable -= reserve;
-	usable -= this_ctx_cost + other_ctx_cost + system_overhead;
+	usable -= workspace_per_ctx + system_overhead;
 
 	if (max_offload_bytes > 0 && usable > max_offload_bytes)
 		usable = max_offload_bytes;
@@ -359,7 +377,8 @@ auto_ngl(const char *path, int gpu, uint32_t n_ctx, uint32_t max_offload_bytes,
 
 	for (i = 0; i < n_layers; i++) {
 		size_t weight = layer_sizes[i];
-		size_t need   = weight * 5 / 2;
+		/* Weight cost (1.2x safety) + KV cache cost for this layer */
+		size_t need = (weight * 6 / 5) + kv_per_layer_all_ctx;
 
 		if (used + need > usable)
 			break;
@@ -381,6 +400,7 @@ struct llama_model *model_load(
 	struct llama_model_params model_params;
 	struct llama_model *model;
 	int n_layers = 0, n_embd = 0, n_ctx_detected = 0;
+	int n_head = 0, n_kv_head = 0;
 	int ngl = 0;
 
     /* Check cache for existing model. qmap stores a pointer-sized value;
@@ -404,11 +424,11 @@ struct llama_model *model_load(
 		n_contexts = 1;
 
 	/* Get model dimensions from GGUF metadata (fast, no model load) */
-	get_model_dims(path, &n_layers, &n_embd, &n_ctx_detected);
+	get_model_dims(path, &n_layers, &n_embd, &n_ctx_detected, &n_head, &n_kv_head);
 
     /* Calculate optimal GPU layers - auto mode if n_gpu_layers is 0 */
     if (n_gpu_layers == 0) {
-        ngl = auto_ngl(path, 0, (uint32_t)n_ctx, 0, n_layers, n_embd, n_contexts);
+        ngl = auto_ngl(path, -1, (uint32_t)n_ctx, 0, n_layers, n_embd, n_contexts, n_head, n_kv_head);
     } else {
         /* Pass-through: user provided number of GPU layers */
         ngl = (int)n_gpu_layers;
@@ -631,8 +651,8 @@ qllm_create(const struct qllm_config *cfg)
 	if (cfg->n_ctx > 0)
 		ctx_params.n_ctx = (uint32_t) cfg->n_ctx;
 	else {
-		int nl = 0, ne = 0, nc = 0;
-		get_model_dims(cfg->model_path, &nl, &ne, &nc);
+		int nl = 0, ne = 0, nc = 0, nh = 0, nkh = 0;
+		get_model_dims(cfg->model_path, &nl, &ne, &nc, &nh, &nkh);
 		if (nc > 0)
 			ctx_params.n_ctx = (uint32_t) nc;
 		else
@@ -640,7 +660,7 @@ qllm_create(const struct qllm_config *cfg)
 	}
 
 	ctx_params.n_batch = ctx_params.n_ctx;
-	ctx_params.n_ubatch = 0;
+	ctx_params.n_ubatch = ctx_params.n_batch > 512 ? 512 : ctx_params.n_batch;
 	ctx_params.n_seq_max = cfg->n_contexts > 0 ? (uint32_t)cfg->n_contexts : 1;
 
 	/* Enable embeddings and mean pooling only if requested.
