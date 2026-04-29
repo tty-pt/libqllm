@@ -49,7 +49,7 @@ LDLIBS-libqllm-Darwin := -lggml-metal -lggml-blas -lomp \
 CMAKE_FLAGS-Linux := -DGGML_VULKAN=ON
 CMAKE_FLAGS-Darwin := -DGGML_METAL=ON
 
-third_party-Linux := ${vulkan}/include/shaderc/shaderc.h
+third_party-Linux := ${vulkan}/include/shaderc/shaderc.h third_party/cjson/cJSON.h
 
 completions := share/bash-completion/completions
 
@@ -60,12 +60,12 @@ install-extra := ${completions}/qllmd
 third_party/cjson/cJSON.h:
 	mkdir -p third_party/cjson
 	wget -qO third_party/cjson/cJSON.h https://raw.githubusercontent.com/DaveGamble/cJSON/v1.7.18/cJSON.h
-
-third_party/cjson/cJSON.c: third_party/cjson/cJSON.h
 	wget -qO third_party/cjson/cJSON.c https://raw.githubusercontent.com/DaveGamble/cJSON/v1.7.18/cJSON.c
 
+third_party/cjson/cJSON.c: third_party/cjson/cJSON.h
+
 third_party/cjson/cJSON.o: third_party/cjson/cJSON.c third_party/cjson/cJSON.h
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(cc) $(CFLAGS) -c $< -o $@
 
 src/qllmd.o: third_party/cjson/cJSON.h
 
@@ -104,7 +104,7 @@ $(vulkan)/include/shaderc/shaderc.h:
 
 # Run the test suite (delegates to tests/Makefile)
 .PHONY: test tests integration live-protocol-test
-test:
+test: third_party/cjson/cJSON.c
 	@echo "[INFO] Running unit tests..."
 	$(MAKE) -C tests run
 	@echo "[INFO] Running integration test with real LLM..."
