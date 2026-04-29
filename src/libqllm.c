@@ -256,15 +256,25 @@ get_model_dims(const char *path, int *n_layers, int *n_embd, int *n_ctx, int *n_
 	gguf_free(ctx);
 }
 
+#define QLLM_WEIGHT_SAFETY_NUM 105
+#define QLLM_WEIGHT_SAFETY_DEN 100
+#define QLLM_VRAM_FALLBACK_NUM 95
+#define QLLM_VRAM_FALLBACK_DEN 100
+#define QLLM_SYSTEM_RESERVE (24ULL * 1024 * 1024)
+
+/* Extern from vulkan.c */
+int qllm_backend_get_vram(size_t *free_b, size_t *total_b, int max_devices);
+
 static int
 auto_ngl(const char *path, int gpu, uint32_t n_ctx, uint32_t max_offload_bytes,
-	 int n_layers, int n_embd, int n_contexts, int n_head, int n_kv_head)
+	 int n_layers, int n_embd, int n_contexts, int n_head, int n_kv_head,
+     float *tensor_split)
 {
-	size_t free_b, total_b;
+	size_t free_b[16], total_b[16];
 	struct gguf_init_params ip = { .no_alloc = true };
 	struct gguf_context *ctx;
 	size_t *layer_sizes;
-	size_t usable;
+	size_t usable = 0;
 	size_t kv_per_layer_all_ctx;
 	size_t workspace_per_ctx;
 	size_t system_overhead;
@@ -273,24 +283,38 @@ auto_ngl(const char *path, int gpu, uint32_t n_ctx, uint32_t max_offload_bytes,
 	size_t largest_layer;
 	int n_tensors;
 	int ngl;
-	int i;
+	int i, n_gpus;
 
 	if (n_contexts <= 0)
 		n_contexts = 1;
 
-	qllm_backend_mem_check(gpu, &free_b, &total_b);
-	if (!total_b)
-		return 0;
+    memset(free_b, 0, sizeof(free_b));
+    memset(total_b, 0, sizeof(total_b));
 
-	if (free_b > 0) {
-		usable = free_b;
-	} else {
-		/* Fallback: assume 75% of total VRAM is usable if budget extension is missing */
-		usable = total_b * 3 / 4;
-	}
+    if (gpu == -2) {
+        n_gpus = qllm_backend_get_vram(free_b, total_b, 16);
+        for (i = 0; i < n_gpus; i++) {
+            size_t dev_usable;
+            if (free_b[i] > 0) dev_usable = free_b[i];
+            else dev_usable = total_b[i] * QLLM_VRAM_FALLBACK_NUM / QLLM_VRAM_FALLBACK_DEN;
+            usable += dev_usable;
+            if (tensor_split) tensor_split[i] = (float)dev_usable;
+        }
+        /* Normalize tensor_split */
+        if (tensor_split && usable > 0) {
+            for (i = 0; i < n_gpus; i++) tensor_split[i] /= (float)usable;
+        }
+    } else {
+        size_t f, t;
+        qllm_backend_mem_check(gpu, &f, &t);
+        if (f > 0) usable = f;
+        else usable = t * QLLM_VRAM_FALLBACK_NUM / QLLM_VRAM_FALLBACK_DEN;
+    }
 
 	if (!usable)
 		return 0;
+
+    fprintf(stderr, "qllm: auto_ngl: GPU mode %d, usable VRAM: %.2f MiB\n", gpu, (double)usable / (1024.0 * 1024.0));
 
 	ctx = gguf_init_from_file(path, ip);
 	if (!ctx)
@@ -355,11 +379,11 @@ auto_ngl(const char *path, int gpu, uint32_t n_ctx, uint32_t max_offload_bytes,
 	/* 2 bytes for K + 2 bytes for V = 4 bytes per token per layer */
 	kv_per_layer_all_ctx = (size_t)n_ctx * n_embd_kv * 4ULL * (size_t)n_contexts;
 
-	/* 5% overhead for system/fragmentation */
-	system_overhead = (kv_per_layer_all_ctx * (size_t)n_layers) / 20;
+	/* 1% overhead for system/fragmentation */
+	system_overhead = (kv_per_layer_all_ctx * (size_t)n_layers) / 100;
 
 	/* Fixed reserve for driver/OS */
-	reserve = 64 * 1024 * 1024ULL;
+	reserve = QLLM_SYSTEM_RESERVE;
 
 	if (usable <= reserve + workspace_per_ctx + system_overhead) {
 		free(layer_sizes);
@@ -377,8 +401,8 @@ auto_ngl(const char *path, int gpu, uint32_t n_ctx, uint32_t max_offload_bytes,
 
 	for (i = 0; i < n_layers; i++) {
 		size_t weight = layer_sizes[i];
-		/* Weight cost (1.2x safety) + KV cache cost for this layer */
-		size_t need = (weight * 6 / 5) + kv_per_layer_all_ctx;
+		/* Weight cost (safety margin) + KV cache cost for this layer */
+		size_t need = (weight * QLLM_WEIGHT_SAFETY_NUM / QLLM_WEIGHT_SAFETY_DEN) + kv_per_layer_all_ctx;
 
 		if (used + need > usable)
 			break;
@@ -386,6 +410,18 @@ auto_ngl(const char *path, int gpu, uint32_t n_ctx, uint32_t max_offload_bytes,
 		used += need;
 		ngl++;
 	}
+    
+    /* Manual adjustment from env */
+    const char *adjust = getenv("QLLM_NGL_ADJUST");
+    if (adjust) {
+        int adj = atoi(adjust);
+        ngl += adj;
+        if (ngl < 0) ngl = 0;
+        if (ngl > n_layers) ngl = n_layers;
+    }
+
+    fprintf(stderr, "qllm: auto_ngl: offloading %d/%d layers, estimated use: %.2f MiB\n", 
+            ngl, n_layers, (double)(used + workspace_per_ctx + reserve) / (1024.0 * 1024.0));
 
 	free(layer_sizes);
 	return ngl;
@@ -402,6 +438,7 @@ struct llama_model *model_load(
 	int n_layers = 0, n_embd = 0, n_ctx_detected = 0;
 	int n_head = 0, n_kv_head = 0;
 	int ngl = 0;
+    float *tensor_split = NULL;
 
     /* Check cache for existing model. qmap stores a pointer-sized value;
      * we store a pointer to a heap-allocated model_cache_entry. qmap_get
@@ -428,7 +465,14 @@ struct llama_model *model_load(
 
     /* Calculate optimal GPU layers - auto mode if n_gpu_layers is 0 */
     if (n_gpu_layers == 0) {
-        ngl = auto_ngl(path, -1, (uint32_t)n_ctx, 0, n_layers, n_embd, n_contexts, n_head, n_kv_head);
+        int gpu_mode = -1; /* default: best GPU */
+        const char *use_all = getenv("QLLM_USE_ALL_GPUS");
+        if (use_all && (use_all[0] == '1' || use_all[0] == 'y' || use_all[0] == 'Y')) {
+            gpu_mode = -2; /* use all GPUs */
+            tensor_split = calloc(llama_max_devices(), sizeof(float));
+        }
+            
+        ngl = auto_ngl(path, gpu_mode, (uint32_t)n_ctx, 0, n_layers, n_embd, n_contexts, n_head, n_kv_head, tensor_split);
     } else {
         /* Pass-through: user provided number of GPU layers */
         ngl = (int)n_gpu_layers;
@@ -441,13 +485,20 @@ struct llama_model *model_load(
     model_params = llama_model_default_params();
     model_params.split_mode = LLAMA_SPLIT_MODE_LAYER;
     model_params.n_gpu_layers = ngl;
+    if (tensor_split) {
+        model_params.tensor_split = tensor_split;
+    }
 
     /* Load model once. The original implementation probed the file to
      * estimate GPU layers and reloaded the model, but that caused an
      * extra free during tests (mock counts). Loading once is sufficient
      * for the unit tests and avoids unexpected intermediate frees. */
-    if (!(model = llama_model_load_from_file(path, model_params)))
+    if (!(model = llama_model_load_from_file(path, model_params))) {
+        free(tensor_split);
         return NULL;
+    }
+    
+    free(tensor_split);
 
     /* Create cache entry and insert into qmap. qmap_put copies the
      * pointer value into its internal slot. With qmap 0.6.0+, the

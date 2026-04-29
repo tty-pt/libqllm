@@ -67,6 +67,20 @@ qllm_backend_mem_check(int gpu, size_t *free_b, size_t *total_b)
 	*total_b = _mock_total_vram;
 }
 
+int
+qllm_backend_get_vram(size_t *free_b, size_t *total_b, int max_devices)
+{
+	int count = _mock_gpu_count;
+	if (count > max_devices)
+		count = max_devices;
+
+	for (int i = 0; i < count; i++) {
+		free_b[i] = _mock_free_vram;
+		total_b[i] = _mock_total_vram;
+	}
+	return count;
+}
+
 VkResult
 vkCreateInstance(const VkInstanceCreateInfo* pCreateInfo,
 		 const void* pAllocator,

@@ -88,6 +88,7 @@ void mock_vulkan_set_instance_create_fail(int should_fail);
 void mock_vulkan_set_no_device_local_memory(int no_device_local);
 
 void qllm_backend_mem_check(int gpu, size_t *free_b, size_t *total_b);
+int qllm_backend_get_vram(size_t *free_b, size_t *total_b, int max_devices);
 
 VkResult vkCreateInstance(const VkInstanceCreateInfo* pCreateInfo,
 			  const void* pAllocator,

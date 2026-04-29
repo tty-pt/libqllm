@@ -18,7 +18,7 @@ vk_create_instance(void)
 		.applicationVersion = VK_MAKE_VERSION(1,0,0),
 		.pEngineName = "none",
 		.engineVersion = VK_MAKE_VERSION(1,0,0),
-		.apiVersion = VK_API_VERSION_1_1,
+		.apiVersion = VK_API_VERSION_1_0,
 	};
 
 	const char *exts[] = {
@@ -33,8 +33,12 @@ vk_create_instance(void)
 	};
 
 	VkInstance instance;
-	if (vkCreateInstance(&ci, NULL, &instance) != VK_SUCCESS)
-		return VK_NULL_HANDLE;
+	if (vkCreateInstance(&ci, NULL, &instance) != VK_SUCCESS) {
+		/* Try without properties2 extension if first attempt fails */
+		ci.enabledExtensionCount = 0;
+		if (vkCreateInstance(&ci, NULL, &instance) != VK_SUCCESS)
+			return VK_NULL_HANDLE;
+	}
 
 	return instance;
 }
@@ -109,9 +113,72 @@ vk_get_best_gpu(VkInstance inst)
 }
 
 /*
+ * Query free and total VRAM for all compatible devices.
+ * Returns the number of devices found.
+ */
+int
+qllm_backend_get_vram(size_t *free_b, size_t *total_b, int max_devices)
+{
+	VkInstance inst = vk_create_instance();
+	if (!inst)
+		return 0;
+
+	uint32_t count = 0;
+	vkEnumeratePhysicalDevices(inst, &count, NULL);
+	if (count == 0) {
+		vkDestroyInstance(inst, NULL);
+		return 0;
+	}
+
+	VkPhysicalDevice *list = malloc(sizeof(*list) * count);
+	vkEnumeratePhysicalDevices(inst, &count, list);
+
+	int n = 0;
+	for (uint32_t i = 0; i < count && n < max_devices; i++) {
+		VkPhysicalDeviceMemoryProperties mem;
+		vkGetPhysicalDeviceMemoryProperties(list[i], &mem);
+
+		uint32_t heap_index = UINT32_MAX;
+		for (uint32_t j = 0; j < mem.memoryHeapCount; j++) {
+			if (mem.memoryHeaps[j].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+				heap_index = j;
+				break;
+			}
+		}
+
+		if (heap_index != UINT32_MAX) {
+			total_b[n] = mem.memoryHeaps[heap_index].size;
+			free_b[n] = 0;
+
+			VkPhysicalDeviceMemoryBudgetPropertiesEXT budget = {
+				.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT
+			};
+			VkPhysicalDeviceMemoryProperties2 props2 = {
+				.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
+				.pNext = &budget
+			};
+			vkGetPhysicalDeviceMemoryProperties2(list[i], &props2);
+
+			if (budget.heapBudget[heap_index] > 0) {
+				size_t used = (size_t) budget.heapUsage[heap_index];
+				size_t budget_b = (size_t) budget.heapBudget[heap_index];
+				if (budget_b > used)
+					free_b[n] = budget_b - used;
+			}
+			n++;
+		}
+	}
+
+	free(list);
+	vkDestroyInstance(inst, NULL);
+	return n;
+}
+
+/*
  * This is the function you asked for.
- *
- * - gpu = GPU index (0 = first GPU, -1 = auto-detect best)
+...
+
+ * - gpu = GPU index (0 = first GPU, -1 = auto-detect best, -2 = all compatible GPUs)
  * - free_b  = output: free VRAM in bytes (if available)
  * - total_b = output: total VRAM in bytes
  */
@@ -125,74 +192,91 @@ qllm_backend_mem_check(int gpu, size_t *free_b, size_t *total_b)
 	if (!inst)
 		return;
 
-	VkPhysicalDevice dev;
-	if (gpu == -1)
-		dev = vk_get_best_gpu(inst);
-	else
-		dev = vk_get_gpu(inst, gpu);
-
-	if (!dev) {
+	uint32_t count = 0;
+	vkEnumeratePhysicalDevices(inst, &count, NULL);
+	if (count == 0) {
 		vkDestroyInstance(inst, NULL);
 		return;
 	}
 
-	/* Query memory heaps. */
-	VkPhysicalDeviceMemoryProperties mem;
-	vkGetPhysicalDeviceMemoryProperties(dev, &mem);
+	VkPhysicalDevice *list = malloc(sizeof(*list) * count);
+	vkEnumeratePhysicalDevices(inst, &count, list);
 
-	/* First: find the DEVICE_LOCAL heap (VRAM). */
-	uint32_t heap_index = UINT32_MAX;
+	if (gpu == -2) {
+		/* Sum memory across all devices */
+		for (uint32_t i = 0; i < count; i++) {
+			VkPhysicalDeviceMemoryProperties mem;
+			vkGetPhysicalDeviceMemoryProperties(list[i], &mem);
 
-	for (uint32_t i = 0; i < mem.memoryHeapCount; i++) {
-		if (mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
-			heap_index = i;
-			break;
+			uint32_t heap_index = UINT32_MAX;
+			for (uint32_t j = 0; j < mem.memoryHeapCount; j++) {
+				if (mem.memoryHeaps[j].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+					heap_index = j;
+					break;
+				}
+			}
+
+			if (heap_index != UINT32_MAX) {
+				*total_b += mem.memoryHeaps[heap_index].size;
+
+				VkPhysicalDeviceMemoryBudgetPropertiesEXT budget = {
+					.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT
+				};
+				VkPhysicalDeviceMemoryProperties2 props2 = {
+					.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
+					.pNext = &budget
+				};
+				vkGetPhysicalDeviceMemoryProperties2(list[i], &props2);
+
+				if (budget.heapBudget[heap_index] > 0) {
+					size_t used = (size_t) budget.heapUsage[heap_index];
+					size_t budget_b = (size_t) budget.heapBudget[heap_index];
+					if (budget_b > used)
+						*free_b += (budget_b - used);
+				}
+			}
+		}
+	} else {
+		VkPhysicalDevice dev;
+		if (gpu == -1)
+			dev = vk_get_best_gpu(inst);
+		else
+			dev = vk_get_gpu(inst, gpu);
+
+		if (dev) {
+			VkPhysicalDeviceMemoryProperties mem;
+			vkGetPhysicalDeviceMemoryProperties(dev, &mem);
+
+			uint32_t heap_index = UINT32_MAX;
+			for (uint32_t i = 0; i < mem.memoryHeapCount; i++) {
+				if (mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+					heap_index = i;
+					break;
+				}
+			}
+
+			if (heap_index != UINT32_MAX) {
+				*total_b = mem.memoryHeaps[heap_index].size;
+
+				VkPhysicalDeviceMemoryBudgetPropertiesEXT budget = {
+					.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT
+				};
+				VkPhysicalDeviceMemoryProperties2 props2 = {
+					.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
+					.pNext = &budget
+				};
+				vkGetPhysicalDeviceMemoryProperties2(dev, &props2);
+
+				if (budget.heapBudget[heap_index] > 0) {
+					size_t used = (size_t) budget.heapUsage[heap_index];
+					size_t budget_b = (size_t) budget.heapBudget[heap_index];
+					if (budget_b > used)
+						*free_b = budget_b - used;
+				}
+			}
 		}
 	}
 
-	if (heap_index == UINT32_MAX) {
-		/* No dedicated VRAM (iGPU). Report zero. */
-		vkDestroyInstance(inst, NULL);
-		return;
-	}
-
-	*total_b = mem.memoryHeaps[heap_index].size;
-
-	/*
-	 * Attempt to get actual free memory via VK_EXT_memory_budget.
-	 * If not available, free_b will remain 0.
-	 */
-
-	/* Prepare structure chain. */
-	VkPhysicalDeviceMemoryBudgetPropertiesEXT budget = {
-		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT
-	};
-
-	VkPhysicalDeviceMemoryProperties2 props2 = {
-		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
-		.pNext = &budget
-	};
-
-	/* Query. Will work only if extension is supported. */
-	vkGetPhysicalDeviceMemoryProperties2(dev, &props2);
-
-	/* If heapBudget contains nonzero, extension is supported. */
-	if (budget.heapBudget[heap_index] > 0) {
-		size_t used = (size_t) budget.heapUsage[heap_index];
-		size_t budget_b = (size_t) budget.heapBudget[heap_index];
-
-		/*
-		 * Vulkan "budget" is the safe amount you can allocate.
-		 * Free VRAM = budget - currently used.
-		 */
-		if (budget_b > used)
-			*free_b = budget_b - used;
-		else
-			*free_b = 0;
-	} else {
-		/* No VK_EXT_memory_budget: best fallback is total only. */
-		*free_b = 0;
-	}
-
+	free(list);
 	vkDestroyInstance(inst, NULL);
 }

@@ -226,11 +226,17 @@ llama_model_default_params(void)
 	memset(&params, 0, sizeof(params));
 	params.n_gpu_layers = 0;
 	params.split_mode = LLAMA_SPLIT_MODE_LAYER;
+	params.tensor_split = NULL;
 	params.vocab_only = false;
 	params.use_mmap = true;
 	params.use_mlock = false;
 	params.check_tensors = false;
 	return params;
+}
+
+size_t llama_max_devices(void)
+{
+	return 16;
 }
 
 struct llama_context_params

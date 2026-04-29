@@ -45,11 +45,14 @@ typedef enum {
 typedef struct llama_model_params {
 	int32_t n_gpu_layers;
 	int split_mode;
+	const float * tensor_split;
 	bool vocab_only;
 	bool use_mmap;
 	bool use_mlock;
 	bool check_tensors;
 } llama_model_params;
+
+size_t llama_max_devices(void);
 
 typedef struct llama_context_params {
 	uint32_t n_ctx;
