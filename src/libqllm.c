@@ -454,7 +454,7 @@ qllm_anchor_start(struct qllm_context *ctx) {
 	if (!QLLM_VALID(ctx)) return;
 	mem = llama_get_memory(ctx->ctx);
 	ctx->anchor_start = ctx->anchor_end
-		= llama_memory_seq_pos_max(mem, 0);
+		= llama_memory_seq_pos_max(mem, ctx->current_seq);
 }
 
 void
@@ -462,7 +462,7 @@ qllm_anchor_end(struct qllm_context *ctx) {
 	llama_memory_t	mem;
 	if (!QLLM_VALID(ctx)) return;
 	mem = llama_get_memory(ctx->ctx);
-	ctx->anchor_end = llama_memory_seq_pos_max(mem, 0);
+	ctx->anchor_end = llama_memory_seq_pos_max(mem, ctx->current_seq);
 }
 
 void
@@ -472,14 +472,23 @@ qllm_compress(struct qllm_context *ctx, uint32_t limit)
 	llama_memory_t mem;
 	int32_t total_tokens;
 	const uint32_t anchor_guard = 16;
+	llama_seq_id seq;
 
 	if (!QLLM_VALID(ctx))
 		return;
 
 	lctx = ctx->ctx;
 	mem = llama_get_memory(lctx);
+	seq = ctx->current_seq;
 
-	total_tokens = llama_memory_seq_pos_max(mem, 0) + 1;
+	if (limit == 0) {
+		llama_memory_seq_rm(mem, seq, 0, -1);
+		ctx->anchor_start = 0;
+		ctx->anchor_end = 0;
+		return;
+	}
+
+	total_tokens = llama_memory_seq_pos_max(mem, seq) + 1;
 	if (total_tokens <= (int32_t)limit)
 		return;
 
@@ -490,8 +499,8 @@ qllm_compress(struct qllm_context *ctx, uint32_t limit)
 		uint32_t prefix_avail = ctx->anchor_start;
 		uint32_t drop_prefix = to_drop > prefix_avail ? prefix_avail : to_drop;
 
-		llama_memory_seq_rm(mem, 0, 0, drop_prefix);
-		llama_memory_seq_add(mem, 0, drop_prefix, total_tokens,
+		llama_memory_seq_rm(mem, seq, 0, drop_prefix);
+		llama_memory_seq_add(mem, seq, drop_prefix, total_tokens,
 				     -(int32_t)drop_prefix);
 
 		ctx->anchor_start -= drop_prefix;
@@ -505,7 +514,7 @@ qllm_compress(struct qllm_context *ctx, uint32_t limit)
 	if (to_drop > 0) {
 		uint32_t drop_start = ctx->anchor_end + anchor_guard;
 
-		/* Se não houver espaço para a margem, começa no anchor_end */
+		/* If no space for guard, start at anchor_end */
 		if (drop_start > (uint32_t)total_tokens)
 			drop_start = ctx->anchor_end;
 
@@ -514,10 +523,10 @@ qllm_compress(struct qllm_context *ctx, uint32_t limit)
 			to_drop = max_drop;
 
 		if (to_drop > 0) {
-			llama_memory_seq_rm(mem, 0,
+			llama_memory_seq_rm(mem, seq,
 					    drop_start,
 					    drop_start + to_drop);
-			llama_memory_seq_add(mem, 0,
+			llama_memory_seq_add(mem, seq,
 					     drop_start + to_drop,
 					     total_tokens,
 					     -(int32_t)to_drop);

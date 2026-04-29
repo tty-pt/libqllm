@@ -45,9 +45,9 @@ const char delimiter = 4;
  * This ensures the model always produces syntactically correct tool calls.
  */
 static const char *tool_call_grammar = 
-    "root ::= (text | tool_call)*\n"
+    "root ::= (text|toolcall)*\n"
     "text ::= [^<]+\n"
-    "tool_call ::= \"<tool_call>\" name \"|\" args \"</tool_call>\"\n"
+    "toolcall ::= \"<tool_call>\" name \"|\" args \"</tool_call>\"\n"
     "name ::= [a-zA-Z0-9_]+\n"
     "args ::= [^<]+\n";
 
@@ -56,6 +56,17 @@ char *crb = NULL;
 
 char qllm_model_path[BUFSIZ];
 static char system_prompt[BUFSIZ] = "";  /* Optional system prompt */
+
+/* Debug helper: append raw request bodies to /tmp/qllmd-requests.log for inspection */
+static void debug_log_request_body(const char *body, size_t len)
+{
+    FILE *f = fopen("/tmp/qllmd-requests.log", "a");
+    if (!f) return;
+    fwrite("---REQUEST---\n", 1, 12, f);
+    fwrite(body, 1, len, f);
+    fwrite("\n---END---\n", 1, 11, f);
+    fclose(f);
+}
 
 /* Chat template types */
 typedef enum {
@@ -358,8 +369,8 @@ calculate_max_system(cJSON *messages, cJSON *tools, int stream)
 		}
 	}
 	
-	int sys_limit = (available - messages_tokens) * 4;
-	return sys_limit > 0 ? sys_limit : 4096;
+    int sys_limit = (available - messages_tokens) * 4;
+    return sys_limit > 0 ? sys_limit : 0;
 }
 
 static char *
@@ -855,6 +866,7 @@ generate(int fd, const char *prompt)
 	int	 step;
 	int	 max_gen = MAX_MEMORY;
 
+	qllm_compress(fdi->ctx, 0);
 	qllm_anchor_start(fdi->ctx);
 	/* Prime qllm context with the full prompt */
 	if (qllm_prime(fdi->ctx, prompt) < 0) {
@@ -1016,6 +1028,7 @@ generate_stream(int fd, const char *prompt)
 	sctx.line_pos = 0;
 	memset(sctx.line_buf, 0, sizeof(sctx.line_buf));
 	
+	qllm_compress(fdi->ctx, 0);
 	qllm_anchor_start(fdi->ctx);
 	/* Prime qllm context with the full prompt */
 	if (qllm_prime(fdi->ctx, prompt) < 0) {
@@ -1250,6 +1263,9 @@ handle_v1_completions(socket_t fd, char *body)
 		return 1;
 	}
 
+	/* Debug: log raw request body */
+	debug_log_request_body(body, strlen(body));
+
 	root = cJSON_Parse(body);
 	if (!root) {
 		http_error(fd, 400, "invalid_request_error", "Invalid JSON");
@@ -1295,6 +1311,7 @@ handle_v1_completions(socket_t fd, char *body)
 
 	full_response[0] = '\0';
 	
+	qllm_compress(fdi->ctx, 0);
 	qllm_anchor_start(fdi->ctx);
 	if (qllm_prime(fdi->ctx, final_prompt) < 0) {
 		http_error(fd, 500, "internal_error", "Generation failed");
@@ -1483,15 +1500,17 @@ handle_v1_chat_completions(socket_t fd, char *body)
 
 		generated[0] = '\0';
 		
+		qllm_compress(fdi->ctx, 0);
 		qllm_anchor_start(fdi->ctx);
 		if (qllm_prime(fdi->ctx, formatted_prompt) < 0) {
-			ndc_writef(fd, "data: {\"error\":\"Generation failed\"}\n\n");
-			ndc_writef(fd, "data: [DONE]\n\n");
-			free(formatted_prompt);
-			cJSON_Delete(root);
-			ndc_close(fd);
-			return 1;
-		}
+            /* Stream a structured OpenAI-style error object instead of a string */
+            ndc_writef(fd, "data: {\"error\":{\"message\":\"Generation failed\",\"type\":\"internal_error\"}}\n\n");
+            ndc_writef(fd, "data: [DONE]\n\n");
+            free(formatted_prompt);
+            cJSON_Delete(root);
+            ndc_close(fd);
+            return 1;
+        }
 		qllm_anchor_end(fdi->ctx);
 		
 		for (step = 0; step < max_gen; step++) {
@@ -1576,6 +1595,7 @@ handle_v1_chat_completions(socket_t fd, char *body)
 
 		full_response[0] = '\0';
 		
+		qllm_compress(fdi->ctx, 0);
 		qllm_anchor_start(fdi->ctx);
 		if (qllm_prime(fdi->ctx, formatted_prompt) < 0) {
 			http_error(fd, 500, "internal_error", "Generation failed");
@@ -1700,10 +1720,11 @@ do_MESSAGES(int fd, int argc, char *argv[])
 	}
 	
 	json_str = malloc(total_len + 1);
-	if (!json_str) {
-		ndc_writef(fd, "{\"error\":\"Out of memory\"}%c\n", delimiter);
-		return;
-	}
+    if (!json_str) {
+        /* Use structured error object for CLI/NDC responses */
+        ndc_writef(fd, "{\"error\":{\"message\":\"Out of memory\",\"type\":\"internal_error\"}}%c\n", delimiter);
+        return;
+    }
 	
 	p = json_str;
 	for (i = 1; i < argc; i++) {
@@ -1715,22 +1736,22 @@ do_MESSAGES(int fd, int argc, char *argv[])
 	
 	/* Parse JSON */
 	root = cJSON_Parse(json_str);
-	if (!root) {
-		const char *err = cJSON_GetErrorPtr();
-		ndc_writef(fd, "{\"error\":\"Invalid JSON\",\"detail\":\"%s\"}%c\n", 
-		          err ? err : "unknown", delimiter);
-		free(json_str);
-		return;
-	}
+    if (!root) {
+        const char *err = cJSON_GetErrorPtr();
+        ndc_writef(fd, "{\"error\":{\"message\":\"Invalid JSON\",\"detail\":\"%s\",\"type\":\"invalid_request_error\"}}%c\n",
+                  err ? err : "unknown", delimiter);
+        free(json_str);
+        return;
+    }
 	
 	/* Extract messages array */
 	messages = cJSON_GetObjectItem(root, "messages");
-	if (!messages || !cJSON_IsArray(messages)) {
-		ndc_writef(fd, "{\"error\":\"messages must be an array\"}%c\n", delimiter);
-		cJSON_Delete(root);
-		free(json_str);
-		return;
-	}
+    if (!messages || !cJSON_IsArray(messages)) {
+        ndc_writef(fd, "{\"error\":{\"message\":\"messages must be an array\",\"type\":\"invalid_request_error\"}}%c\n", delimiter);
+        cJSON_Delete(root);
+        free(json_str);
+        return;
+    }
 	
 	/* Extract stream flag (optional) */
 	stream_val = cJSON_GetObjectItem(root, "stream");
@@ -1744,12 +1765,12 @@ do_MESSAGES(int fd, int argc, char *argv[])
 	/* Format conversation (with tools if present) */
 	int max_sys = calculate_max_system(messages, tools, stream);
 	formatted_prompt = format_conversation(messages, tools, model_template, 0, max_sys);
-	if (!formatted_prompt) {
-		ndc_writef(fd, "{\"error\":\"Failed to format conversation\"}%c\n", delimiter);
-		cJSON_Delete(root);
-		free(json_str);
-		return;
-	}
+    if (!formatted_prompt) {
+        ndc_writef(fd, "{\"error\":{\"message\":\"Failed to format conversation\",\"type\":\"internal_error\"}}%c\n", delimiter);
+        cJSON_Delete(root);
+        free(json_str);
+        return;
+    }
 	
 	/* Generate response - streaming or blocking */
 	if (stream) {

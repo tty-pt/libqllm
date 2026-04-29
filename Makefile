@@ -56,6 +56,8 @@ completions := share/bash-completion/completions
 install-dirs := ${completions}
 install-extra := ${completions}/qllmd
 
+all:
+
 # cJSON dependency for qllmd
 third_party/cjson/cJSON.h:
 	mkdir -p third_party/cjson

@@ -9,3 +9,4 @@
 /tests/test_runner
 /tests/test_auto_ngl
 /tests/integration/__pycache__
+.aider*
