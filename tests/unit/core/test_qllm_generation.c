@@ -33,16 +33,44 @@ TEST(auto_ngl_basic_calculation)
 {
 	mock_gguf_init();
 	mock_vulkan_init();
+    mock_llama_init();
+    mock_qmap_init();
 
 	mock_vulkan_set_total_vram(8ULL * 1024 * 1024 * 1024);
 	mock_vulkan_set_free_vram(4ULL * 1024 * 1024 * 1024);
+
+    mock_gguf_set_kv_string("general.architecture", "llama");
+    mock_gguf_set_kv_uint32("llama.block_count", 4);
+    mock_gguf_set_kv_uint32("llama.embedding_length", 4096);
+    mock_gguf_set_kv_uint32("llama.attention.head_count", 32);
+    mock_gguf_set_kv_uint32("llama.context_length", 2048);
 
 	mock_gguf_add_tensor("blk.0.attn.weight", 100 * 1024 * 1024);
 	mock_gguf_add_tensor("blk.1.attn.weight", 100 * 1024 * 1024);
 	mock_gguf_add_tensor("blk.2.attn.weight", 100 * 1024 * 1024);
 	mock_gguf_add_tensor("blk.3.attn.weight", 100 * 1024 * 1024);
+    
+    /* Non-layer weights (400 MiB total) */
+    mock_gguf_add_tensor("token_embd.weight", 200 * 1024 * 1024);
+    mock_gguf_add_tensor("output.weight", 200 * 1024 * 1024);
 
-	ASSERT_TRUE(1);
+    struct qllm_config cfg = {
+        .model_path = "/fake/model.gguf",
+        .n_ctx = 512,
+        .n_threads = 1,
+    };
+    
+    struct qllm_context *ctx = qllm_create(&cfg);
+    ASSERT_NOT_NULL(ctx);
+    
+    struct llama_model_params mparams = mock_llama_get_last_model_params();
+    /* 4 layers (400 MiB) + base (400 MiB) + overhead should fit in 4 GiB */
+    ASSERT_EQ(mparams.n_gpu_layers, 4);
+    
+    struct llama_context_params cparams = mock_llama_get_last_context_params();
+    ASSERT_EQ(cparams.offload_kqv, 1); /* bool in mock is int-compatible */
+
+    qllm_free(ctx);
 }
 
 TEST(auto_ngl_zero_vram)
@@ -56,11 +84,36 @@ TEST(auto_ngl_zero_vram)
 
 TEST(auto_ngl_small_vram)
 {
+	mock_gguf_init();
 	mock_vulkan_init();
+    mock_llama_init();
+    mock_qmap_init();
+
 	mock_vulkan_set_total_vram(256 * 1024 * 1024);
 	mock_vulkan_set_free_vram(128 * 1024 * 1024);
 
-	ASSERT_TRUE(1);
+    mock_gguf_set_kv_string("general.architecture", "llama");
+    mock_gguf_set_kv_uint32("llama.block_count", 4);
+    mock_gguf_set_kv_uint32("llama.embedding_length", 4096);
+    mock_gguf_set_kv_uint32("llama.attention.head_count", 32);
+    mock_gguf_set_kv_uint32("llama.context_length", 2048);
+
+	mock_gguf_add_tensor("blk.0.attn.weight", 100 * 1024 * 1024);
+
+    struct qllm_config cfg = {
+        .model_path = "/fake/model.gguf",
+        .n_ctx = 512,
+        .n_threads = 1,
+    };
+    
+    struct qllm_context *ctx = qllm_create(&cfg);
+    ASSERT_NOT_NULL(ctx);
+    
+    struct llama_model_params mparams = mock_llama_get_last_model_params();
+    /* 128 MiB free, need ~132 MiB for overhead + blk.0, should be 0 layers */
+    ASSERT_EQ(mparams.n_gpu_layers, 0);
+
+    qllm_free(ctx);
 }
 
 TEST(qllm_prime_null_ctx)

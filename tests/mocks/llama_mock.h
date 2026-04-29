@@ -62,6 +62,7 @@ typedef struct llama_context_params {
 	int32_t n_threads;
 	int32_t n_threads_batch;
 	bool embeddings;
+    bool offload_kqv;
 	int pooling_type;
 } llama_context_params;
 
@@ -130,8 +131,9 @@ int mock_llama_get_model_load_count(void);
 int mock_llama_get_context_create_count(void);
 int mock_llama_get_decode_count(void);
 int mock_llama_get_sample_count(void);
-
 int mock_llama_get_model_free_count(void);
+struct llama_model_params mock_llama_get_last_model_params(void);
+struct llama_context_params mock_llama_get_last_context_params(void);
 
 void mock_llama_reset_counts(void);
 

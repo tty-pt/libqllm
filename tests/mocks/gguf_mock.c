@@ -150,19 +150,6 @@ gguf_init_from_file(const char *path, struct gguf_init_params params)
         else
             ctx->tensors[i].name = NULL;
         ctx->tensors[i].size = _mock_tensors[i].size;
-
-        /* If strdup failed, clean up previously-allocated names and return NULL. */
-        if (_mock_tensors[i].name && ctx->tensors[i].name == NULL) {
-            int j;
-            for (j = 0; j < i; j++)
-                free((void*)ctx->tensors[j].name);
-            free(ctx->tensors);
-            free(ctx);
-            return NULL;
-        }
-        /* Free the global mock name now that the ctx owns a copy. */
-        free((void*)_mock_tensors[i].name);
-        _mock_tensors[i].name = NULL;
     }
 
 	/* Copy KV pairs */

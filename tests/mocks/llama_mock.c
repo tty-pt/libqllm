@@ -37,6 +37,9 @@ static int _model_counter = 0;
 static int _context_counter = 0;
 static int _model_free_count = 0;
 
+static struct llama_model_params _last_model_params = {0};
+static struct llama_context_params _last_context_params = {0};
+
 struct llama_model {
 	int id;
 	int n_layer;
@@ -210,6 +213,18 @@ mock_llama_get_model_free_count(void)
     return _model_free_count;
 }
 
+struct llama_model_params
+mock_llama_get_last_model_params(void)
+{
+    return _last_model_params;
+}
+
+struct llama_context_params
+mock_llama_get_last_context_params(void)
+{
+    return _last_context_params;
+}
+
 void
 mock_llama_reset_counts(void)
 {
@@ -217,6 +232,8 @@ mock_llama_reset_counts(void)
 	_context_create_count = 0;
 	_decode_count = 0;
 	_sample_count = 0;
+    memset(&_last_model_params, 0, sizeof(_last_model_params));
+    memset(&_last_context_params, 0, sizeof(_last_context_params));
 }
 
 struct llama_model_params
@@ -251,6 +268,7 @@ llama_context_default_params(void)
 	params.n_threads = 4;
 	params.n_threads_batch = 4;
 	params.embeddings = false;
+    params.offload_kqv = true;
 	params.pooling_type = LLAMA_POOLING_TYPE_NONE;
 	return params;
 }
@@ -280,6 +298,7 @@ llama_model_load_from_file(const char *path, struct llama_model_params params)
 	struct llama_model *model;
 
 	_model_load_count++;
+    _last_model_params = params;
 
 	if (_mock_model_load_fail)
 		return NULL;
@@ -336,6 +355,7 @@ llama_init_from_model(struct llama_model *model, struct llama_context_params par
 	struct llama_context *ctx;
 
 	_context_create_count++;
+    _last_context_params = params;
 
 	if (_mock_context_create_fail)
 		return NULL;
