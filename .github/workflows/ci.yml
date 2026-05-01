@@ -14,7 +14,8 @@ jobs:
       deps_apk: "libqsys,libqmap,libndc,vulkan-loader,vulkan-loader-dev,vulkan-headers,vulkan-tools,cmake,xz,wget"
       deps_rpm: "libqsys,libqmap,libndc,vulkan-headers,vulkan-loader,vulkan-loader-devel,vulkan-tools,glslang,cmake,wget,g++"
       deps_brew: "libqsys,libqmap,libndc,cmake,libomp"
-      deps_winget: "libqsys,libqmap,libndc,cmake,wget"
+      deps_winget: "mingw-w64-x86_64-cmake,wget"
+      deps_winget_tty: "libqsys,libqmap,libndc"
       publish_to: "deb,rpm,brew,winget"
     secrets:
       HOST: ${{ secrets.OPENBSD_HOST }}
