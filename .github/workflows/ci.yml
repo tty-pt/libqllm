@@ -16,7 +16,7 @@ jobs:
       deps_brew: "libqsys,libqmap,libndc,cmake,libomp"
       deps_winget: "mingw-w64-x86_64-cmake,wget"
       deps_winget_tty: "libqsys,libqmap,libndc"
-      publish_to: "deb,rpm,brew,winget"
+      publish_to: "deb,rpm,brew"
     secrets:
       HOST: ${{ secrets.OPENBSD_HOST }}
       USER: ${{ secrets.OPENBSD_USER }}
