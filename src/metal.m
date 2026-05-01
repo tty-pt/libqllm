@@ -96,6 +96,39 @@ io_vram_total(void)
 	return vram;
 }
 
+int
+qllm_backend_get_vram(size_t *free_b, size_t *total_b, int max_devices)
+{
+	void *handle = dlopen("/System/Library/Frameworks/Metal.framework/Metal", RTLD_LAZY);
+	if (!handle)
+		return 0;
+
+	mtl_copy_all_t MTLCopyAllDevicesFunc =
+		(mtl_copy_all_t) dlsym(handle, "MTLCopyAllDevices");
+	if (!MTLCopyAllDevicesFunc)
+		return 0;
+
+	id arr = MTLCopyAllDevicesFunc();
+	if (!arr)
+		return 0;
+
+	NSUInteger count =
+		((NSUInteger (*)(id, SEL)) objc_msgSend)(arr, sel_registerName("count"));
+
+	int n = (int)count < max_devices ? (int)count : max_devices;
+
+	for (int i = 0; i < n; i++) {
+		free_b[i] = 0;
+
+		uint64_t total = io_vram_total();
+		if (!total)
+			total = metal_get_total_vram(i);
+		total_b[i] = (size_t) total;
+	}
+
+	return n;
+}
+
 void
 qllm_backend_mem_check(int gpu, size_t *free_b, size_t *total_b)
 {
