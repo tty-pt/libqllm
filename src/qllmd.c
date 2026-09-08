@@ -1,7 +1,7 @@
-#include <ttypt/ndc.h>
+#include <ttypt/axil.h>
+#include <ttypt/qllm.h>
 #include <ttypt/qmap.h>
 #include <ttypt/qsys.h>
-#include "./../include/ttypt/qllm.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,49 +9,40 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define DEFAULT_SEQ_MAX 4
-#define MAX_TOKENS 1024
-#define MAX_MEMORY (MAX_TOKENS * 10)
-#define FEAT_GENERAL 0
-
-struct qllm_context;
+#define MAX_MSGS 64
+#define REC_END "\r\n.\r\n"
 
 typedef struct fd_info {
 	char			line_buf[BUFSIZ * 4];
-	struct qllm_context *	ctx;
-	unsigned		end_pos;
 	unsigned		line_pos;
+	struct qllm_context *	ctx;
+	struct qllm_message	msgs[MAX_MSGS];	/* content heap-owned except msgs[0] (crb) */
+	size_t			n_msgs;
+	char			*prev_prompt;	/* malloc'd: last rendered prompt */
+	char			*assistant_buf;	/* malloc'd: in-progress reply */
+	size_t			assist_len;
 } fdi_t;
-
-fdi_t fdis[FD_SETSIZE], general;
-
-const char *start = "<|im_start|>";
-
-const char *end = "<|im_end|>";
-const unsigned end_len = 10;
-
-size_t crb_len = 0;
-char *crb = NULL;
-
-static char qllm_model_path[BUFSIZ];
 
 typedef struct gen_state {
 	int	fd;
 	fdi_t *fdi;
-	int	stop;
 } gen_state_t;
 
-struct ndc_config ndc_config = {
-	.flags = NDC_DETACH,
+fdi_t fdis[FD_SETSIZE];
+
+size_t crb_len = 0;
+char *crb_mapped = NULL;
+char *crb_system = NULL;	/* NUL-terminated heap copy of crb.txt */
+
+static char qllm_model_path[BUFSIZ];
+
+unsigned n_contexts = 1;
+unsigned n_ctx = 0;
+
+struct axil_config axil_config = {
+	.flags = AXIL_DETACH,
 	.port = 4242,
 };
-
-#if FEAT_GENERAL
-unsigned n_contexts = 2;
-#else
-unsigned n_contexts = 1;
-#endif
-unsigned n_ctx = 0;
 
 static inline void
 append_to_line(fdi_t *fdi, const char *s, size_t len)
@@ -74,10 +65,9 @@ append_to_line(fdi_t *fdi, const char *s, size_t len)
 }
 
 static inline void
-reset_fdi(fdi_t *fdi)
+line_reset(fdi_t *fdi)
 {
 	fdi->line_pos = 0;
-	fdi->end_pos = 0;
 	memset(fdi->line_buf, 0, sizeof(fdi->line_buf));
 }
 
@@ -88,7 +78,7 @@ void cmd_cb(
 	int ofd __attribute__((unused)))
 {
 	/* Just echo command output back to client. */
-	ndc_write(fd, buf, len);
+	axil_write(fd, buf, len);
 }
 
 static inline void
@@ -124,201 +114,241 @@ cmd_exec(int fd, fdi_t *fdi)
 	if (space)
 		*space = '\0';
 
-	ndc_exec(fd, args, cmd_cb, NULL, 0);
-	ndc_write(fd, "\n", 1);
+	axil_exec(fd, args, cmd_cb, NULL, 0);
+	axil_write(fd, "\n", 1);
 }
 
 /*
- * Process a text chunk from qllm and stream it to the client,
- * handling:
- *  - detection of the "<|im_end|>" marker (not printed),
- *  - line buffering and command execution on newline.
+ * Evict the oldest messages to make room for a new one, keeping the
+ * system message (crb) at msgs[0] and the newest MAX_MSGS-1 entries.
+ * Forces prev_prompt to NULL so the next turn re-primes from the
+ * surviving suffix.
  */
-static inline void
-process_chunk(gen_state_t *st, const char *chunk, size_t len)
+static void
+fdi_evict_oldest(fdi_t *fdi)
 {
+	size_t keep = crb_system ? 1 : 0;
+	size_t want = MAX_MSGS - 1;
+	size_t evict, i;
+
+	if (fdi->n_msgs < MAX_MSGS)
+		return;
+
+	evict = fdi->n_msgs - want;
+	if (evict > fdi->n_msgs - keep)
+		evict = fdi->n_msgs - keep;
+
+	for (i = keep; i < keep + evict; ++i)
+		free((void *)fdi->msgs[i].content);
+
+	for (i = 0; i + keep + evict < fdi->n_msgs; ++i)
+		fdi->msgs[keep + i] = fdi->msgs[keep + evict + i];
+
+	fdi->n_msgs -= evict;
+
+	free(fdi->prev_prompt);
+	fdi->prev_prompt = NULL;
+}
+
+static int
+push_msg(fdi_t *fdi, const char *role, const char *content)
+{
+	char *dup;
+
+	if (fdi->n_msgs >= MAX_MSGS)
+		fdi_evict_oldest(fdi);
+
+	dup = strdup(content ? content : "");
+	if (!dup)
+		return -1;
+
+	fdi->msgs[fdi->n_msgs].role = role;
+	fdi->msgs[fdi->n_msgs].content = dup;
+	fdi->n_msgs++;
+	return 0;
+}
+
+/* Free the message contents (keeping the crb system message) and all
+ * session buffers; re-establish the system message. */
+static inline void
+fdi_clear_msgs(fdi_t *fdi)
+{
+	size_t i;
+
+	for (i = 0; i < fdi->n_msgs; ++i)
+		if (fdi->msgs[i].content != crb_system)
+			free((void *)fdi->msgs[i].content);
+
+	fdi->n_msgs = 0;
+	if (crb_system) {
+		fdi->msgs[0].role = "system";
+		fdi->msgs[0].content = crb_system;
+		fdi->n_msgs = 1;
+	}
+
+	free(fdi->prev_prompt);
+	fdi->prev_prompt = NULL;
+	free(fdi->assistant_buf);
+	fdi->assistant_buf = NULL;
+	fdi->assist_len = 0;
+}
+
+static inline void
+fdi_reset(fdi_t *fdi)
+{
+	fdi_clear_msgs(fdi);
+	line_reset(fdi);
+}
+
+static inline int
+fdi_ensure_ctx(fdi_t *fdi)
+{
+	struct qllm_config cfg;
+
+	if (fdi->ctx)
+		return 0;
+
+	cfg.model_path = qllm_model_path;
+	cfg.n_ctx = n_ctx;
+	cfg.n_threads = 0;
+	cfg.max_offload_bytes = 0;
+	cfg.n_contexts = n_contexts;
+
+	fdi->ctx = qllm_create(&cfg);
+	if (!fdi->ctx) {
+		qsyslog(QLOG_ERR, "Failed to init qllm context\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * Echo a generated chunk to the client, buffer it as the current
+ * assistant reply, and process newlines for "$ " command execution.
+ */
+static void
+qllm_chat_cb(void *user, const char *chunk, size_t len)
+{
+	gen_state_t *st = user;
 	fdi_t *fdi = st->fdi;
 	int fd = st->fd;
+	size_t i;
 
-	for (size_t i = 0; i < len; ++i) {
-		char ch = chunk[i];
+	axil_write(fd, (void *)chunk, len);
 
-		/* Normal character */
-		ndc_write(fd, &ch, 1);
-		append_to_line(fdi, &ch, 1);
+	if (len) {
+		char *nb = realloc(fdi->assistant_buf,
+		    fdi->assist_len + len + 1);
+		if (nb) {
+			memcpy(nb + fdi->assist_len, chunk, len);
+			fdi->assist_len += len;
+			nb[fdi->assist_len] = '\0';
+			fdi->assistant_buf = nb;
+		}
+	}
 
-        /* Command execution on newline */
-		if (ch == '\n') {
+	for (i = 0; i < len; ++i) {
+		append_to_line(fdi, &chunk[i], 1);
+		if (chunk[i] == '\n') {
 			cmd_exec(fd, fdi);
-			reset_fdi(fdi);
+			line_reset(fdi);
 		}
 	}
 }
 
-
-static inline int
-inference(int fd, fdi_t *fdi)
+static void
+do_ASK(int fd, int argc, char *argv[])
 {
-	char	buf[MAX_MEMORY];
-	int	ret;
-	size_t	buflen;
-	char	*eoim;
+	fdi_t *fdi = &fdis[fd];
+	gen_state_t st;
+	char *user;
+	size_t total = 1;
+	char *rendered = NULL;
+	size_t rlen = 0;
+	int i, ret;
 
-	/* Get next piece of text from qllm */
-	ret = qllm_next(fdi->ctx, buf, sizeof(buf));
-	if (ret < 0)
-		return 0;	/* error -> stop */
+	if (fdi_ensure_ctx(fdi) != 0)
+		return;
 
-	if (ret == 0)
-		return 0;	/* EOS -> stop */
+	for (i = 1; i < argc; ++i)
+		total += strlen(argv[i]) + (i > 1 ? 1 : 0);
 
-	buflen = (size_t)ret;
-
-	/* Mesma lógica de antes para detectar "<|im_end|>" */
-	eoim = strchr(buf, *(end + fdi->end_pos));
-	if (eoim && (eoim - buf) <= end_len - fdi->end_pos) {
-		size_t clen = buflen - (size_t)(eoim - buf);
-
-		if (strncmp(eoim, end + fdi->end_pos, clen))
-			goto end;
-
-		fdi->end_pos += clen;
-
-		if (fdi->end_pos < end_len)
-			return 1;
-
-		fdi->end_pos = 0;
-		return 0;
-	}
-
-end:
-	if (fdi->end_pos) {
-		ndc_write(fd, (void *)end, fdi->end_pos);
-		append_to_line(fdi, end, fdi->end_pos);
-		fdi->end_pos = 0;
-	}
-
-	ndc_write(fd, buf, buflen);
-	append_to_line(fdi, buf, buflen);
-
-	if (strrchr(buf, '\n')) {
-		cmd_exec(fd, fdi);
-		fdi->line_pos = 0;
-	}
-
-	return 1;
-}
-
-void
-generate(int fd, const char *prompt)
-{
-	fdi_t	*fdi = &fdis[fd];
-	int	 step;
-	int	 max_gen = MAX_MEMORY;
-
-	/* Prime qllm context with the full prompt */
-	if (qllm_prime(fdi->ctx, prompt) < 0) {
-		qsyslog(QLOG_ERR, "qllm_prime failed\n");
+	user = malloc(total);
+	if (!user) {
+		axil_writef(fd, "Out of memory\n");
 		return;
 	}
 
-	fdi->line_pos = 0;
-	fdi->end_pos = 0;
-
-	for (step = 0;
-	     step < max_gen && inference(fd, fdi);
-	     ++step)
-		;
-
-	cmd_exec(fd, fdi);
-	fdi->line_pos = 0;
-}
-
-void
-do_ASK(int fd, int argc, char *argv[])
-{
-	fdi_t *fdi __attribute__((unused)) = &fdis[fd];
-	char buf[BUFSIZ * 2], *b = buf;
-	int i, ret;
-
-	b += snprintf(b, sizeof(buf) - (b - buf), "%suser\n", start);
-	for (i = 1; i < argc; i++) {
-		ret = snprintf(b, sizeof(buf) - (b - buf), " %s", argv[i]);
-		if (ret < 0 || (size_t)ret >= sizeof(buf) - (size_t)(b - buf)) {
-			ndc_writef(fd, "Buffer size exceeded\n");
-			return;
-		}
-		b += ret;
+	user[0] = '\0';
+	for (i = 1; i < argc; ++i) {
+		if (i > 1)
+			strcat(user, " ");
+		strcat(user, argv[i]);
 	}
-	b += snprintf(b, sizeof(buf) - (b - buf), "%s\n%sassistant\n ", end, start);
 
-	generate(fd, buf);
-	ndc_writef(fd, "%s\n", end);
-}
-
-static inline void
-fdi_init(fdi_t *fdi)
-{
-	struct qllm_config cfg = {
-		.model_path = qllm_model_path,
-		.n_ctx = n_ctx,
-		.n_threads = 0,
-		.n_contexts = n_contexts,
-	};
-
-	if (fdi->ctx && fdi->ctx != general.ctx)
-		qllm_free(fdi->ctx);
-
-	fprintf(stderr, "N_CONTEXTS! %d\n", cfg.n_contexts);
-	fdi->ctx = qllm_create(&cfg);
-	/* fdi->ctx = general.ctx; */
-	if (!fdi->ctx)
-		qsyslog(QLOG_ERR, "Failed to init qllm context\n");
-
-	reset_fdi(fdi);
-}
-
-void
-do_CHAT(int fd, int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
-{
-	fdi_init(&fdis[fd]);
-}
-
-struct cmd_slot cmds[] = {
-	{
-		.name = "ask",
-		.cb = &do_ASK,
-		.flags = CF_NOAUTH | CF_NOTRIM,
-	}, {
-		.name = "chat",
-		.cb = &do_CHAT,
-		.flags = CF_NOAUTH | CF_NOTRIM,
-	}, {
-		.name = NULL
+	if (push_msg(fdi, "user", user) != 0) {
+		free(user);
+		axil_writef(fd, "Out of memory\n");
+		return;
 	}
-};
+	free(user);
+
+	st.fd = fd;
+	st.fdi = fdi;
+
+	ret = qllm_chat(fdi->ctx, fdi->msgs, fdi->n_msgs,
+	    fdi->prev_prompt, qllm_chat_cb, &st);
+	if (ret != 0)
+		qsyslog(QLOG_ERR, "qllm_chat failed\n");
+
+	/* Fold the completed reply into the conversation history. */
+	if (fdi->assistant_buf)
+		push_msg(fdi, "assistant", fdi->assistant_buf);
+	free(fdi->assistant_buf);
+	fdi->assistant_buf = NULL;
+	fdi->assist_len = 0;
+
+	/* Recompute prev_prompt as the exact state after this turn. */
+	if (qllm_render(fdi->ctx, fdi->msgs, fdi->n_msgs,
+	    false, &rendered, &rlen) == 0) {
+		free(fdi->prev_prompt);
+		fdi->prev_prompt = rendered;
+	}
+
+	axil_write(fd, (void *)REC_END, strlen(REC_END));
+}
+
+static void
+do_CHAT(int fd, int argc __attribute__((unused)),
+    char *argv[] __attribute__((unused)))
+{
+	fdi_t *fdi = &fdis[fd];
+
+	/* Clear history, keep the context (KV is reset below). */
+	fdi_reset(fdi);
+
+	/* Drop the previous KV cache but keep the shared model handle. */
+	if (fdi->ctx)
+		qllm_reset(fdi->ctx);
+}
 
 int
-ndc_accept(int fd)
+axil_accept(int fd)
 {
-#if FEAT_GENERAL
-	fdis[fd].ctx = general.ctx;
-#else
-	reset_fdi(&fdis[fd]);
-#endif
+	fdi_reset(&fdis[fd]);
 	return 0;
 }
 
 void
-ndc_disconnect(int fd __attribute__((unused)))
+axil_disconnect(int fd __attribute__((unused)))
 {
 	fdi_t *fdi = &fdis[fd];
 
-	if (fdi->ctx && fdi->ctx != general.ctx)
+	if (fdi->ctx)
 		qllm_free(fdi->ctx);
-
 	fdi->ctx = NULL;
-	reset_fdi(fdi);
+	fdi_reset(fdi);
 }
 
 static void
@@ -341,25 +371,15 @@ usage(char *prog)
 static void
 setup(const char *model_path)
 {
-#if FEAT_GENERAL
-	struct qllm_config cfg = {
-		.model_path = model_path,
-		.n_ctx = n_ctx,
-		.n_threads = 0,
-		.n_contexts = n_contexts,
-	};
-
-	general.ctx = qllm_create(&cfg);
-	CBUG(!general.ctx,
-			"Failed to create qllm context\n");
-
-	reset_fdi(&general);
-#endif
+	ssize_t r;
 
 	snprintf(qllm_model_path, sizeof(qllm_model_path), "%s", model_path);
 
-	crb_len = (size_t)ndc_mmap(&crb, "crb.txt");
-	(void)crb_len;
+	r = axil_mmap(&crb_mapped, "crb.txt");
+	if (r > 0) {
+		crb_len = (size_t)r;
+		crb_system = strndup(crb_mapped, crb_len);
+	}
 }
 
 int
@@ -372,14 +392,14 @@ main(int argc, char *argv[])
 	FILE *fp;
 	char cmd[BUFSIZ];
 	char *nl;
-	int ret;
+	int ret, i;
 
 	qsys_openlog("qllmd");
-	ndc_config.port = 4242;
+	axil_config.port = 4242;
 
 	while ((c = getopt(argc, argv, "?dK:k:C:rp:s:n:c:")) != -1) switch (c) {
 		case 'd':
-			ndc_config.flags &= ~NDC_DETACH;
+			axil_config.flags &= ~AXIL_DETACH;
 			break;
 
 		case 'K':
@@ -387,19 +407,19 @@ main(int argc, char *argv[])
 			break;
 
 		case 'C':
-			ndc_config.chroot = strdup(optarg);
+			axil_config.chroot = strdup(optarg);
 			break;
 
 		case 'r':
-			ndc_config.flags |= NDC_ROOT;
+			axil_config.flags |= AXIL_ROOT;
 			break;
 
 		case 'p':
-			ndc_config.port = atoi(optarg);
+			axil_config.port = atoi(optarg);
 			break;
 
 		case 's':
-			ndc_config.ssl_port = atoi(optarg);
+			axil_config.ssl_port = atoi(optarg);
 			break;
 
 		case 'n':
@@ -419,11 +439,11 @@ main(int argc, char *argv[])
 
 	while ((c = getopt(argc, argv, "?dK:k:C:rp:s:n:c:")) != -1) switch (c) {
 		case 'K':
-			ndc_certs_add(optarg);
+			axil_certs_add(optarg);
 			break;
 
 		case 'k':
-			ndc_cert_add(optarg);
+			axil_cert_add(optarg);
 			break;
 
 		default:
@@ -448,15 +468,21 @@ main(int argc, char *argv[])
 		arg_model = model_path;
 	}
 
-	ndc_register("ask", do_ASK, CF_NOAUTH | CF_NOTRIM);
-	ndc_register("chat", do_CHAT, CF_NOAUTH | CF_NOTRIM);
+	axil_register("ask", do_ASK, CF_NOAUTH | CF_NOTRIM);
+	axil_register("chat", do_CHAT, CF_NOAUTH | CF_NOTRIM);
 
 	setup(arg_model);
 
-	ret = ndc_main();
+	ret = axil_main();
 
-	if (general.ctx)
-		qllm_free(general.ctx);
+	for (i = 0; i < FD_SETSIZE; ++i) {
+		if (fdis[i].ctx) {
+			qllm_free(fdis[i].ctx);
+			fdis[i].ctx = NULL;
+		}
+	}
+
+	free(crb_system);
 
 	return ret;
 }

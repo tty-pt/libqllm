@@ -1,4 +1,4 @@
-all := libqllm qllmd
+all := libqllm qllmd qllm-chat
 INSTALL_BIN := qllmd qllm-chat qllm-path qllm-list
 
 libqllm-obj-y-Linux := src/vulkan.o
@@ -31,10 +31,10 @@ CFLAGS-Darwin := -I${omp}/include
 ggmlp := ${llamacpp}/ggml/src
 
 LDFLAGS-libqllm := -L${llamacpp}/src -L${ggmlp}
-LDFLAGS-Linux := -L${ggmlp}/ggml-vulkan
+LDFLAGS-Linux := -L${ggmlp}/ggml-vulkan -L${vulkan}/lib
 LDFLAGS-Darwin := -L${ggmlp}/ggml-metal -L${ggmlp}/ggml-blas -L${omp}/lib
 
-LDLIBS-qllmd := -lqsys -lndc -lqllm
+LDLIBS-qllmd := -lqsys -laxil -lqllm
 
 LDLIBS-libqllm := -lllama -lggml -lggml-cpu -lggml-base -lqmap -ldl -lpthread -lm -lstdc++
 LDLIBS-libqllm-Linux := -lgomp -lvulkan -lggml-vulkan
@@ -60,7 +60,9 @@ include ./../mk/include.mk
 src/libqllm.o: $(llamacpp)/src/libllama.a
 
 $(llamacpp)/src/libllama.a: ${llamacpp}/Makefile
-	make -C ${llamacpp} -j4
+	make -C ${llamacpp} -j1; \
+	scripts/vkgen-repair.sh ${llamacpp} ${vulkan}/bin/glslc; \
+	make -C ${llamacpp} -j1
 
 $(llamacpp)/Makefile: ${third_party-${uname}}
 	echo "[INFO] Using Vulkan SDK in $(vulkan)"; \
@@ -68,6 +70,8 @@ $(llamacpp)/Makefile: ${third_party-${uname}}
 	export VULKAN_SDK="$(abspath $(vulkan))" && \
 		export PATH="$$VULKAN_SDK/bin:$$PATH" && \
 		export LD_LIBRARY_PATH="$$VULKAN_SDK/lib:$$LD_LIBRARY_PATH" && \
+		export CC=clang && \
+		export CXX=clang++ && \
 		cd ${llamacpp} && \
 		cmake .. ${CMAKE_FLAGS-${uname}} \
 			-DCMAKE_INSTALL_PREFIX:PATH=${PREFIX}/share/qllm \

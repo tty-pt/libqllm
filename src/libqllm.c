@@ -623,3 +623,119 @@ qllm_next(struct qllm_context *qctx,
 
 	return n_piece;
 }
+
+int
+qllm_render(struct qllm_context *qctx,
+	    const struct qllm_message *msgs, size_t n_msgs,
+	    bool add_ass, char **out, size_t *out_len)
+{
+	const char *tmpl;
+	struct llama_chat_message *chat;
+	int32_t len;
+	char *buf;
+	size_t i;
+
+	if (!qctx || !msgs || n_msgs == 0 || !out || !out_len)
+		return -1;
+
+	tmpl = llama_model_chat_template(qctx->model, NULL);
+	if (!tmpl) {
+		qsyslog(QLOG_ERR, "model has no chat template\n");
+		return -1;
+	}
+
+	chat = calloc(n_msgs, sizeof(*chat));
+	if (!chat)
+		return -1;
+
+	for (i = 0; i < n_msgs; i++) {
+		chat[i].role = msgs[i].role;
+		chat[i].content = msgs[i].content;
+	}
+
+	/* Two-pass sizing */
+	len = llama_chat_apply_template(tmpl, chat, n_msgs, add_ass, NULL, 0);
+	if (len < 0) {
+		free(chat);
+		return -1;
+	}
+
+	buf = calloc((size_t)len + 1, 1);
+	if (!buf) {
+		free(chat);
+		return -1;
+	}
+
+	len = llama_chat_apply_template(tmpl, chat, n_msgs, add_ass, buf, len);
+	free(chat);
+
+	if (len < 0) {
+		free(buf);
+		return -1;
+	}
+
+	buf[len] = '\0';
+	*out = buf;
+	*out_len = (size_t)len;
+	return 0;
+}
+
+void
+qllm_reset(struct qllm_context *qctx)
+{
+	if (!qctx || !qctx->ctx)
+		return;
+
+	llama_memory_clear(llama_get_memory(qctx->ctx), true);
+	qctx->cur_pos = 0;
+}
+
+int
+qllm_chat(struct qllm_context *qctx,
+	  const struct qllm_message *msgs, size_t n_msgs,
+	  const char *prev_prompt,
+	  qllm_token_cb cb, void *user)
+{
+	char *full = NULL;
+	size_t full_len = 0;
+	const char *incr;
+	int32_t step;
+	int ret;
+
+	if (!qctx || !msgs || n_msgs == 0 || !cb)
+		return -1;
+
+	/* Render full conversation with add_ass=true */
+	if (qllm_render(qctx, msgs, n_msgs, true, &full, &full_len) != 0)
+		return -1;
+
+	/* Compute the incremental prompt */
+	if (prev_prompt && full_len >= strlen(prev_prompt) &&
+	    memcmp(full, prev_prompt, strlen(prev_prompt)) == 0) {
+		incr = full + strlen(prev_prompt);
+	} else {
+		incr = full;
+	}
+
+	/* Prime with only the new content */
+	ret = qllm_prime(qctx, incr);
+	if (ret != 0) {
+		free(full);
+		return -1;
+	}
+
+	/* Stream tokens until EOG */
+	for (step = 0; step < qctx->max_tokens; ++step) {
+		char piece[256];
+		int n;
+
+		n = qllm_next(qctx, piece, sizeof(piece));
+		if (n <= 0)
+			break;
+
+		cb(user, piece, (size_t)n);
+	}
+
+	free(full);
+	return 0;
+}

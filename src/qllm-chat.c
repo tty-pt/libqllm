@@ -6,14 +6,14 @@
 #include <netdb.h>
 
 #define PORT      4242
-#define END_TAG   "<|im"
+#define REC_END   "\r\n.\r\n"   /* daemon record terminator */
+#define REC_END_LEN 6
 
 int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused))) {
 	int sock;
 	struct sockaddr_in server_addr;
 	char buf[BUFSIZ];
 	char msg[BUFSIZ];
-	char response[BUFSIZ];
 
 	sock = socket(AF_INET, SOCK_STREAM, 0);
 	if (sock < 0) {
@@ -41,11 +41,18 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 	setvbuf(stdout, NULL, _IONBF, 0);
 	printf("Connected! Type your prompts (empty line to quit).\n\n");
 
+	int tty = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
+
 	while (1) {
-		printf("> ");
+		char pend[REC_END_LEN - 1];
+		size_t npend = 0;
+		int done = 0;
+
+		if (tty)
+			printf("> ");
 
 		if (!fgets(buf, sizeof(buf), stdin))
-			continue;
+			break;
 
 		size_t len = strlen(buf);
 		if (len == 0 || buf[0] == '\n')
@@ -66,27 +73,44 @@ int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 			break;
 		}
 
-		int first_skip = 1;
-		while (1) {
-			ssize_t cn = read(sock, response,
-					sizeof(response) - 1);
+		while (!done) {
+			ssize_t cn = read(sock, buf, sizeof(buf));
 
 			if (cn <= 0)
 				break;
 
-			response[cn] = '\0';
-
-			char *end = strstr(response, END_TAG);
-			if (end) {
-				*end = '\0';
-				printf("%s", response + first_skip);
+			size_t total = npend + (size_t) cn;
+			char *comb = malloc(total + 1);
+			if (!comb)
 				break;
+
+			memcpy(comb, pend, npend);
+			memcpy(comb + npend, buf, (size_t) cn);
+			comb[total] = '\0';
+
+			char *match = strstr(comb, REC_END);
+			if (match) {
+				fwrite(comb, 1, (size_t)(match - comb), stdout);
+				done = 1;
+			} else {
+				size_t safe = total >= REC_END_LEN - 1
+				    ? total - (REC_END_LEN - 1) : 0;
+
+				fwrite(comb, 1, safe, stdout);
+				npend = total - safe;
+				memcpy(pend, comb + safe, npend);
 			}
 
-			printf("%s", response + first_skip);
-			first_skip = 0;
+			free(comb);
 		}
+
 		putchar('\n');
+
+		if (!done) {
+			fprintf(stderr,
+			    "Connection closed before reply completed\n");
+			break;
+		}
 	}
 
 	close(sock);

@@ -1,6 +1,7 @@
 #ifndef QLLM_H
 #define QLLM_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -104,6 +105,45 @@ int
 qllm_next(struct qllm_context *ctx,
 	  char *out,
 	  size_t out_size);
+
+/* Chat message — mirrors llama_chat_message. */
+struct qllm_message {
+	const char *role;    /* "system" | "user" | "assistant" | ... */
+	const char *content;
+};
+
+/*
+ * Streaming chat completion.
+ * Renders the full conversation via the model's chat template, primes the
+ * context with only the newly-added increment, then streams via cb().
+ * prev_prompt is the previously rendered prompt (or NULL for the first turn).
+ * Returns 0 on success, < 0 on error.
+ */
+int
+qllm_chat(struct qllm_context *ctx,
+	  const struct qllm_message *msgs, size_t n_msgs,
+	  const char *prev_prompt,
+	  qllm_token_cb cb, void *user);
+
+/*
+ * Render a conversation with the model's chat template.
+ * add_ass=true appends the assistant prefix (for priming generation);
+ * add_ass=false renders the exact conversation state.
+ * On success *out is malloc'd (caller frees) and *out_len is set.
+ * Returns 0 on success, < 0 on error.
+ */
+int
+qllm_render(struct qllm_context *ctx,
+	    const struct qllm_message *msgs, size_t n_msgs,
+	    bool add_ass,
+	    char **out, size_t *out_len);
+
+/*
+ * Reset the context's generation state: clears the KV cache and resets the
+ * running position, keeping the loaded model and context alive.
+ */
+void
+qllm_reset(struct qllm_context *ctx);
 
 #ifdef __cplusplus
 }
