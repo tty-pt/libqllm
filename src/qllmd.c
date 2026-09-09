@@ -1,34 +1,57 @@
 #include <ttypt/axil.h>
-#include <ttypt/qllm.h>
-#include <ttypt/qmap.h>
 #include <ttypt/qsys.h>
 
+#include "openai_chat.h"
 #include "openai_embed.h"
+#include "qllm-engine.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define MAX_MSGS 64
 #define REC_END "\r\n.\r\n"
 
+/* Per-telnet-connection state. LLM state lives in the engine (sessions keyed
+ * by the connection's fd); the loop thread only keeps the input line being
+ * assembled (for "$ " command execution inside streamed output) and a busy
+ * flag so overlapping ask turns are rejected at submit time. */
 typedef struct fd_info {
 	char			line_buf[BUFSIZ * 4];
 	unsigned		line_pos;
-	struct qllm_context *	ctx;
-	struct qllm_message	msgs[MAX_MSGS];	/* content heap-owned except msgs[0] (crb) */
-	size_t			n_msgs;
-	char			*prev_prompt;	/* malloc'd: last rendered prompt */
-	char			*assistant_buf;	/* malloc'd: in-progress reply */
-	size_t			assist_len;
+	unsigned		busy;
+	unsigned long		epoch;	/* bumps on each accept; guards stale jobs */
 } fdi_t;
 
-typedef struct gen_state {
-	int	fd;
-	fdi_t *fdi;
-} gen_state_t;
+/* Per-deferred-response bookkeeping carried in each engine job's ud.
+ * Owned by the loop-thread drain callback, which frees it.
+ *   - EMBED:      handle = deferred response, mode = 0, sid = 0
+ *   - CHAT:       handle = NULL, mode = 0,  sid = the telnet fd
+ *   - one-shot:   handle = deferred response, mode = 1 if streaming, sid = 0
+ * `epoch` is only meaningful for CHAT: it must match fdis[sid].epoch or the
+ * connection was replaced and the (possibly stale) results must be dropped. */
+typedef struct pending {
+	void 		*handle;
+	int   		mode;
+	int   		sid;
+	unsigned long	epoch;
+} pending_t;
+
+pending_t *
+make_pending(void *handle, int mode, int sid)
+{
+	pending_t *p = malloc(sizeof(*p));
+
+	if (p) {
+		p->handle = handle;
+		p->mode = mode;
+		p->sid = sid;
+		p->epoch = 0;
+	}
+	return p;
+}
 
 fdi_t fdis[FD_SETSIZE];
 
@@ -120,158 +143,18 @@ cmd_exec(int fd, fdi_t *fdi)
 	axil_write(fd, "\n", 1);
 }
 
-/*
- * Evict the oldest messages to make room for a new one, keeping the
- * system message (crb) at msgs[0] and the newest MAX_MSGS-1 entries.
- * Forces prev_prompt to NULL so the next turn re-primes from the
- * surviving suffix.
- */
-static void
-fdi_evict_oldest(fdi_t *fdi)
-{
-	size_t keep = crb_system ? 1 : 0;
-	size_t want = MAX_MSGS - 1;
-	size_t evict, i;
-
-	if (fdi->n_msgs < MAX_MSGS)
-		return;
-
-	evict = fdi->n_msgs - want;
-	if (evict > fdi->n_msgs - keep)
-		evict = fdi->n_msgs - keep;
-
-	for (i = keep; i < keep + evict; ++i)
-		free((void *)fdi->msgs[i].content);
-
-	for (i = 0; i + keep + evict < fdi->n_msgs; ++i)
-		fdi->msgs[keep + i] = fdi->msgs[keep + evict + i];
-
-	fdi->n_msgs -= evict;
-
-	free(fdi->prev_prompt);
-	fdi->prev_prompt = NULL;
-}
-
-static int
-push_msg(fdi_t *fdi, const char *role, const char *content)
-{
-	char *dup;
-
-	if (fdi->n_msgs >= MAX_MSGS)
-		fdi_evict_oldest(fdi);
-
-	dup = strdup(content ? content : "");
-	if (!dup)
-		return -1;
-
-	fdi->msgs[fdi->n_msgs].role = role;
-	fdi->msgs[fdi->n_msgs].content = dup;
-	fdi->n_msgs++;
-	return 0;
-}
-
-/* Free the message contents (keeping the crb system message) and all
- * session buffers; re-establish the system message. */
-static inline void
-fdi_clear_msgs(fdi_t *fdi)
-{
-	size_t i;
-
-	for (i = 0; i < fdi->n_msgs; ++i)
-		if (fdi->msgs[i].content != crb_system)
-			free((void *)fdi->msgs[i].content);
-
-	fdi->n_msgs = 0;
-	if (crb_system) {
-		fdi->msgs[0].role = "system";
-		fdi->msgs[0].content = crb_system;
-		fdi->n_msgs = 1;
-	}
-
-	free(fdi->prev_prompt);
-	fdi->prev_prompt = NULL;
-	free(fdi->assistant_buf);
-	fdi->assistant_buf = NULL;
-	fdi->assist_len = 0;
-}
-
-static inline void
-fdi_reset(fdi_t *fdi)
-{
-	fdi_clear_msgs(fdi);
-	line_reset(fdi);
-}
-
-static inline int
-fdi_ensure_ctx(fdi_t *fdi)
-{
-	struct qllm_config cfg;
-
-	if (fdi->ctx)
-		return 0;
-
-	cfg.model_path = qllm_model_path;
-	cfg.n_ctx = n_ctx;
-	cfg.n_threads = 0;
-	cfg.max_offload_bytes = 0;
-	cfg.n_contexts = n_contexts;
-
-	fdi->ctx = qllm_create(&cfg);
-	if (!fdi->ctx) {
-		qsyslog(QLOG_ERR, "Failed to init qllm context\n");
-		return -1;
-	}
-
-	return 0;
-}
-
-/*
- * Echo a generated chunk to the client, buffer it as the current
- * assistant reply, and process newlines for "$ " command execution.
- */
-static void
-qllm_chat_cb(void *user, const char *chunk, size_t len)
-{
-	gen_state_t *st = user;
-	fdi_t *fdi = st->fdi;
-	int fd = st->fd;
-	size_t i;
-
-	axil_write(fd, (void *)chunk, len);
-
-	if (len) {
-		char *nb = realloc(fdi->assistant_buf,
-		    fdi->assist_len + len + 1);
-		if (nb) {
-			memcpy(nb + fdi->assist_len, chunk, len);
-			fdi->assist_len += len;
-			nb[fdi->assist_len] = '\0';
-			fdi->assistant_buf = nb;
-		}
-	}
-
-	for (i = 0; i < len; ++i) {
-		append_to_line(fdi, &chunk[i], 1);
-		if (chunk[i] == '\n') {
-			cmd_exec(fd, fdi);
-			line_reset(fdi);
-		}
-	}
-}
-
 static void
 do_ASK(int fd, int argc, char *argv[])
 {
 	fdi_t *fdi = &fdis[fd];
-	gen_state_t st;
 	char *user;
 	size_t total = 1;
-	char *rendered = NULL;
-	size_t rlen = 0;
-	int i, ret;
+	int i;
 
-	if (fdi_ensure_ctx(fdi) != 0)
+	if (fdi->busy) {
+		axil_write(fd, "Busy\n", 5);
 		return;
+	}
 
 	for (i = 1; i < argc; ++i)
 		total += strlen(argv[i]) + (i > 1 ? 1 : 0);
@@ -289,56 +172,41 @@ do_ASK(int fd, int argc, char *argv[])
 		strcat(user, argv[i]);
 	}
 
-	if (push_msg(fdi, "user", user) != 0) {
-		free(user);
-		axil_writef(fd, "Out of memory\n");
-		return;
+	fdi->busy = 1;
+	{
+		pending_t *p = make_pending(NULL, 0, fd);
+
+		if (!p) {
+			fdi->busy = 0;
+			axil_writef(fd, "Out of memory\n");
+			free(user);
+			return;
+		}
+		p->epoch = fdi->epoch;
+		if (qllm_engine_chat(fd, user, p, NULL) != 0) {
+			free(p);
+			fdi->busy = 0;
+			axil_writef(fd, "Engine busy\n");
+		}
 	}
 	free(user);
-
-	st.fd = fd;
-	st.fdi = fdi;
-
-	ret = qllm_chat(fdi->ctx, fdi->msgs, fdi->n_msgs,
-	    fdi->prev_prompt, qllm_chat_cb, &st);
-	if (ret != 0)
-		qsyslog(QLOG_ERR, "qllm_chat failed\n");
-
-	/* Fold the completed reply into the conversation history. */
-	if (fdi->assistant_buf)
-		push_msg(fdi, "assistant", fdi->assistant_buf);
-	free(fdi->assistant_buf);
-	fdi->assistant_buf = NULL;
-	fdi->assist_len = 0;
-
-	/* Recompute prev_prompt as the exact state after this turn. */
-	if (qllm_render(fdi->ctx, fdi->msgs, fdi->n_msgs,
-	    false, &rendered, &rlen) == 0) {
-		free(fdi->prev_prompt);
-		fdi->prev_prompt = rendered;
-	}
-
-	axil_write(fd, (void *)REC_END, strlen(REC_END));
 }
 
 static void
 do_CHAT(int fd, int argc __attribute__((unused)),
     char *argv[] __attribute__((unused)))
 {
-	fdi_t *fdi = &fdis[fd];
-
-	/* Clear history, keep the context (KV is reset below). */
-	fdi_reset(fdi);
-
-	/* Drop the previous KV cache but keep the shared model handle. */
-	if (fdi->ctx)
-		qllm_reset(fdi->ctx);
+	/* Clear the connection's session history + KV in the engine. */
+	if (qllm_engine_session_reset(fd, NULL, NULL) != 0)
+		qsyslog(QLOG_ERR, "chat reset queue full\n");
 }
 
 int
 axil_accept(int fd)
 {
-	fdi_reset(&fdis[fd]);
+	fdis[fd].busy = 0;
+	fdis[fd].epoch++;
+	line_reset(&fdis[fd]);
 	return 0;
 }
 
@@ -347,10 +215,115 @@ axil_disconnect(int fd __attribute__((unused)))
 {
 	fdi_t *fdi = &fdis[fd];
 
-	if (fdi->ctx)
-		qllm_free(fdi->ctx);
-	fdi->ctx = NULL;
-	fdi_reset(fdi);
+	/* Release the engine session; the worker frees ctx/history. */
+	if (qllm_engine_session_close(fd, NULL, NULL) != 0)
+		qsyslog(QLOG_ERR, "session close queue full\n");
+
+	fdi->busy = 0;
+	line_reset(fdi);
+}
+
+/* Feed a streamed chunk's newlines through "$ " command execution. */
+static void
+chat_handle_chunk(int fd, const char *chunk, size_t len)
+{
+	fdi_t *fdi = &fdis[fd];
+	size_t i;
+
+	for (i = 0; i < len; ++i) {
+		append_to_line(fdi, &chunk[i], 1);
+		if (chunk[i] == '\n') {
+			cmd_exec(fd, fdi);
+			line_reset(fdi);
+		}
+	}
+}
+
+/* Loop-thread completion drain: complete deferred responses from the engine.
+ * Owns/frees the pending_t attached to the job's ud. Meta results (open/reset/
+ * close) carry ud = NULL and need no response. */
+static void
+drain(void *cbud __attribute__((unused)),
+    const struct qllm_engine_result *r)
+{
+	pending_t *p = r->ud;
+
+	if (!p)
+		return;
+
+	if (r->kind == QE_JOB_EMBED) {
+		if (r->err)
+			axil_respond_defer_abort(p->handle);
+		else
+			axil_respond_defer_finish(p->handle, r->payload);
+		free(p);
+		return;
+	}
+
+	if (r->kind == QE_JOB_CHAT) {
+		int fd = p->sid;
+
+		/* The connection moved on (closed and its fd reused): these
+		 * results belong to a dead generation — drop them entirely. */
+		if (fdis[fd].epoch != p->epoch) {
+			free(p);
+			return;
+		}
+
+		if (r->more) {
+			size_t len = r->payload ? strlen(r->payload) : 0;
+
+			if (len)
+				axil_write(fd, r->payload, len);
+			chat_handle_chunk(fd, r->payload ? r->payload : "", len);
+			return;   /* keep pending until the final result */
+		}
+
+		/* Final: end the streaming body; the chunks are already sent. */
+		axil_write(fd, (void *)REC_END, strlen(REC_END));
+		fdis[fd].busy = 0;
+		free(p);
+		return;
+	}
+
+	if (r->kind == QE_JOB_CHAT_ONESHOT) {
+		socket_t fd = (socket_t)(intptr_t)p->handle;
+
+		if (p->mode && r->more) {
+			axil_write(fd, "data: ", 6);
+			if (r->payload)
+				axil_write(fd, r->payload, strlen(r->payload));
+			axil_write(fd, "\n\n", 2);
+			return;   /* keep pending until the final result */
+		}
+
+		if (p->mode) {
+			if (r->payload) {
+				axil_write(fd, "data: ", 6);
+				axil_write(fd, r->payload, strlen(r->payload));
+				axil_write(fd, "\n\n", 2);
+			}
+			axil_write(fd, "data: [DONE]\n\n", 15);
+			axil_respond_defer_done(p->handle);
+		} else if (r->err) {
+			axil_respond_defer_abort(p->handle);
+		} else {
+			axil_respond_defer_finish(p->handle, r->payload);
+		}
+		free(p);
+		return;
+	}
+
+	free(p);
+}
+
+/* Strong override of the weak axil_fd_tick (loop thread): the engine's
+ * self-pipe woke the loop, so drain whatever completed. */
+void
+axil_fd_tick(socket_t fd)
+{
+	(void)fd;
+	qllm_engine_poll(drain, NULL);
 }
 
 static void
@@ -394,7 +367,7 @@ main(int argc, char *argv[])
 	FILE *fp;
 	char cmd[BUFSIZ];
 	char *nl;
-	int ret, i;
+	int ret;
 
 	qsys_openlog("qllmd");
 	axil_config.port = 4242;
@@ -475,18 +448,24 @@ main(int argc, char *argv[])
 
 	setup(arg_model);
 
+	if (qllm_engine_init(qllm_model_path) != 0) {
+		qsyslog(QLOG_ERR, "Failed to init engine\n");
+		return 1;
+	}
+
+	qllm_engine_set_system(crb_system);
+
+	axil_fd_watch(qllm_engine_wake_fd());
+
 	openai_embed_init(qllm_model_path);
+	openai_chat_init(qllm_model_path);
 
 	ret = axil_main();
 
-	for (i = 0; i < FD_SETSIZE; ++i) {
-		if (fdis[i].ctx) {
-			qllm_free(fdis[i].ctx);
-			fdis[i].ctx = NULL;
-		}
-	}
+	qllm_engine_shutdown();
 
 	openai_embed_shutdown();
+	openai_chat_shutdown();
 	free(crb_system);
 
 	return ret;

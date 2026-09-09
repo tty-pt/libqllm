@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include <llama.h>
 #include <gguf.h>
@@ -33,6 +34,56 @@ struct qllm_context {
 
 static int qllm_backend_inited;
 static uint32_t qm_model, model_hd;
+
+/* Reference-counted handles to the shared (cached) model instances so that
+ * multiple qllm_create() contexts can share one model while any of them may
+ * call qllm_free() without destroying the model out from under the others.
+ * All model access is serialized on model_lock (loads are rare). */
+static struct shared_model {
+	struct llama_model	*model;
+	int			 refs;
+	struct shared_model	*next;
+} *shared_models;
+static pthread_mutex_t model_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void
+shared_model_ref(struct llama_model *m)
+{
+	struct shared_model *sm;
+
+	for (sm = shared_models; sm; sm = sm->next)
+		if (sm->model == m) {
+			++sm->refs;
+			return;
+		}
+	sm = calloc(1, sizeof(*sm));
+	if (!sm)
+		return;
+	sm->model = m;
+	sm->refs = 1;
+	sm->next = shared_models;
+	shared_models = sm;
+}
+
+static void
+shared_model_unref(struct llama_model *m)
+{
+	struct shared_model *sm, **p;
+
+	for (p = &shared_models; *p; p = &(*p)->next)
+		if ((*p)->model == m)
+			break;
+	sm = *p;
+	if (!sm) {
+		llama_model_free(m);
+		return;
+	}
+	if (--sm->refs > 0)
+		return;
+	*p = sm->next;
+	free(sm);
+	llama_model_free(m);
+}
 
 /* Initialize llama backend exactly once. */
 __attribute__((constructor)) void 
@@ -227,9 +278,15 @@ struct llama_model *model_load(
 	struct llama_model ** model_r, *model;
 	int n_layers, n_embd, ngl;
 
+	pthread_mutex_lock(&model_lock);
+
 	model_r = (struct llama_model **) qmap_get(model_hd, path);
-	if (model_r)
-		return *model_r;
+	if (model_r) {
+		model = *model_r;
+		shared_model_ref(model);
+		pthread_mutex_unlock(&model_lock);
+		return model;
+	}
 
 	if (!n_contexts)
 		n_contexts = 1;
@@ -241,8 +298,10 @@ struct llama_model *model_load(
 	model_params.n_gpu_layers = 0;
 	if (!(model = llama_model_load_from_file(
 			path,
-			model_params)))
+			model_params))) {
+		pthread_mutex_unlock(&model_lock);
 		return NULL;
+	}
 
 	n_layers = llama_model_n_layer(model);
 	n_embd = llama_model_n_embd(model);
@@ -256,10 +315,14 @@ struct llama_model *model_load(
 
 	if (!(model = llama_model_load_from_file(
 			path,
-			model_params)))
+			model_params))) {
+		pthread_mutex_unlock(&model_lock);
 		return NULL;
+	}
 
 	qmap_put(model_hd, path, &model);
+	shared_model_ref(model);
+	pthread_mutex_unlock(&model_lock);
 	return model;
 }
 
@@ -358,7 +421,7 @@ qllm_free(struct qllm_context *qctx)
 	if (qctx->ctx)
 		llama_free(qctx->ctx);
 	if (qctx->model)
-		llama_model_free(qctx->model);
+		shared_model_unref(qctx->model);
 
 	free(qctx->token_buf);
 	free(qctx->seq_ids);

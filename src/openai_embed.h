@@ -5,19 +5,21 @@
  * OpenAI-compatible embeddings endpoint for qllmd.
  *
  * Registers the HTTP handler "POST:/v1/embeddings" that parses an
- * OpenAI-style request body and answers with the OpenAI embeddings
- * JSON shape, backed by qllm_embed().
+ * OpenAI-style request body, defers the response, and submits the embed
+ * job to the engine worker. The completion is delivered later via
+ * qllmd.c's loop-thread `drain` callback using axil_respond_defer_finish.
  */
 
 /*
- * Register the /v1/embeddings route and configure the shared embed
- * context. model_path is the GGUF model served by the daemon.
+ * Register the /v1/embeddings route. model_path is accepted for API
+ * consistency only; the model context lives in the engine worker.
  * Returns 0 on success, -1 on failure.
  */
 int openai_embed_init(const char *model_path);
 
 /*
- * Tear down the shared embed context. Call at shutdown.
+ * No-op in the async design; the engine owns model teardown via
+ * qllm_engine_shutdown().
  */
 void openai_embed_shutdown(void);
 

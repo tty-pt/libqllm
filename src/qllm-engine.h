@@ -24,17 +24,27 @@ extern "C" {
 /* Job kinds. */
 enum {
 	QE_JOB_EMBED = 1, /* OpenAI-style embeddings for a single text string */
-	QE_JOB_CHAT,      /* reserved (Phase 3); rejected in Phase 1 */
+	QE_JOB_CHAT,      /* telnet: incremental session chat (sid) */
+	QE_JOB_CHAT_ONESHOT, /* HTTP: stateless chat, input = full request JSON */
+	QE_JOB_OPEN,      /* meta: open/ensure a session slot for sid */
+	QE_JOB_RESET,     /* meta: reset session history + KV */
+	QE_JOB_CLOSE,     /* meta: close/free a session slot */
 };
 
 /* Result of one completed job. Valid only during the received callback; the
- * engine frees `payload` after the callback returns (copy if you need it). */
+ * engine frees `payload` after the callback returns (copy if you need it).
+ * A chat job produces MULTIPLE results: `more=1` for every streamed chunk,
+ * then one final result with `more=0` (the full reply text for QE_JOB_CHAT,
+ * or the tail JSON for a streamed oneshot). `seq` counts per-job results
+ * starting at 0. Non-chat jobs produce exactly one result (more=0, seq=0). */
 struct qllm_engine_result {
-	int   job_id; /* echoed from qllm_engine_submit's *job_id_out */
-	int   kind;   /* QE_JOB_* */
-	int   err;    /* 0 = ok, else negative error code */
-	char *payload; /* NUL-terminated JSON on success; NULL on error */
-	void *ud;     /* echoed opaque pointer from qllm_engine_submit */
+	int   job_id;   /* echoed from the submit/job_id_out */
+	int   kind;     /* QE_JOB_* */
+	int   err;      /* 0 = ok, else negative error code */
+	int   more;     /* 1 = more chunk(s) follow, 0 = final result for the job */
+	int   seq;      /* per-job result sequence, starting at 0 */
+	char *payload;  /* NUL-terminated text/JSON on success; NULL on error */
+	void *ud;       /* echoed opaque pointer from the submit call */
 };
 
 typedef void (*qllm_engine_result_cb)(
@@ -60,6 +70,41 @@ void qllm_engine_shutdown(void);
  * engine is not initialized or the job queue is full.
  */
 int qllm_engine_submit(int kind, const char *input, void *ud, int *job_id_out);
+
+/*
+ * Submit a telnet chat turn for an already-open (or to-be-opened) session.
+ * The session is created on first use and evicted LRU when all 16 slots are
+ * occupied by sessions with queued work. Results stream as chunks (more=1)
+ * followed by one final full-reply result (more=0); every result echoes `ud`.
+ * Returns 0 on accepted (job_id_out set), -1 on queue full / not running.
+ */
+int qllm_engine_chat(int sid, const char *input, void *ud, int *job_id_out);
+
+/*
+ * Submit a stateless HTTP chat request. `request_json` is the full OpenAI-style
+ * body; the engine parses "messages" and honors "stream". When stream is true,
+ * results are `{"choices":[{"delta":{"content":..},"index":0}]}` chunks then a
+ * final streaming-closed delta; otherwise a single chat.completion JSON result.
+ */
+int qllm_engine_chat_oneshot(const char *request_json, void *ud, int *job_id_out);
+
+/*
+ * Session bookkeeping. These are all queued to the worker (like any job) so the
+ * worker thread alone manipulates session LLM state — open/reset/close can never
+ * race an in-flight generation. Results arrive as one OPEN/RESET/CLOSE result.
+ * `ud` is echoed. Returns 0 on accepted, -1 on queue full / not running.
+ */
+int qllm_engine_session_open(int sid, const char *system_prompt, void *ud, int *job_id_out);
+int qllm_engine_session_reset(int sid, void *ud, int *job_id_out);
+int qllm_engine_session_close(int sid, void *ud, int *job_id_out);
+
+/*
+ * Provide the engine-global system prompt. Used for CHAT sessions opened
+ * without an explicit system prompt and prepended to ONESHOT requests that
+ * don't already include a "system" message. The engine strdup's it; pass NULL
+ * to clear. Loop-thread (startup) call; may be called before any jobs.
+ */
+int qllm_engine_set_system(const char *system_prompt);
 
 /*
  * Drain completed results. Returns the number of results delivered. Each
