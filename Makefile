@@ -4,6 +4,12 @@ INSTALL_BIN := qllmd qllm-chat qllm-path qllm-list
 libqllm-obj-y-Linux := src/vulkan.o
 libqllm-obj-y-Darwin := src/metal.o
 
+# qllmd-obj-y is pulled into the link recipe by include.mk. The generic
+# include.mk only wires BIN prerequisites from single-word ${BIN} lists, so
+# also add the object as an explicit link prerequisite.
+qllmd-obj-y := src/openai_embed.o
+bin/qllmd: src/openai_embed.o
+
 llamacpp := submodules/llama.cpp/build
 
 uname := $(shell uname)
@@ -34,7 +40,7 @@ LDFLAGS-libqllm := -L${llamacpp}/src -L${ggmlp}
 LDFLAGS-Linux := -L${ggmlp}/ggml-vulkan -L${vulkan}/lib
 LDFLAGS-Darwin := -L${ggmlp}/ggml-metal -L${ggmlp}/ggml-blas -L${omp}/lib
 
-LDLIBS-qllmd := -lqsys -laxil -lqllm
+LDLIBS-qllmd := -lqsys -laxil -lqllm -ljson-c
 
 LDLIBS-libqllm := -lllama -lggml -lggml-cpu -lggml-base -lqmap -ldl -lpthread -lm -lstdc++
 LDLIBS-libqllm-Linux := -lgomp -lvulkan -lggml-vulkan

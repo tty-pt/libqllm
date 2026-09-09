@@ -3,6 +3,8 @@
 #include <ttypt/qmap.h>
 #include <ttypt/qsys.h>
 
+#include "openai_embed.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -473,6 +475,8 @@ main(int argc, char *argv[])
 
 	setup(arg_model);
 
+	openai_embed_init(qllm_model_path);
+
 	ret = axil_main();
 
 	for (i = 0; i < FD_SETSIZE; ++i) {
@@ -482,6 +486,7 @@ main(int argc, char *argv[])
 		}
 	}
 
+	openai_embed_shutdown();
 	free(crb_system);
 
 	return ret;

@@ -44,11 +44,15 @@ qllm_init(void)
 	qllm_backend_inited = 1;
 }
 
-/* Small helper to decode a batch of tokens at the current position. */
+/* Small helper to decode a batch of tokens at the current position.
+ * With all_logits, every token is marked as an output (required for
+ * mean-pooled embeddings so the pooling op sees all token embeddings);
+ * otherwise only the last token is marked (chat/generation). */
 static int
 qllm_decode_tokens(struct qllm_context *qctx,
 		   const llama_token *tokens,
-		   int32_t n_tokens)
+		   int32_t n_tokens,
+		   int all_logits)
 {
 	struct llama_batch batch;
 	int32_t i;
@@ -68,7 +72,7 @@ qllm_decode_tokens(struct qllm_context *qctx,
 		batch.n_seq_id[i] = 1;
 		qctx->seq_ids[i] = 0;
 		batch.seq_id[i] = &qctx->seq_ids[i];
-		batch.logits[i] = (i == n_tokens - 1);
+		batch.logits[i] = all_logits || (i == n_tokens - 1);
 	}
 
 	if (llama_decode(qctx->ctx, batch) != 0)
@@ -397,7 +401,7 @@ qllm_generate_stream_internal(struct qllm_context *qctx,
 	if (n_prompt == 0)
 		return 0;
 
-	if (qllm_decode_tokens(qctx, qctx->token_buf, n_prompt) != 0)
+	if (qllm_decode_tokens(qctx, qctx->token_buf, n_prompt, 0) != 0)
 		return -1;
 
 	for (step = 0; step < max_gen; ++step) {
@@ -408,7 +412,7 @@ qllm_generate_stream_internal(struct qllm_context *qctx,
 			break;
 
 		qctx->token_buf[0] = tok;
-		if (qllm_decode_tokens(qctx, qctx->token_buf, 1) != 0)
+		if (qllm_decode_tokens(qctx, qctx->token_buf, 1, 0) != 0)
 			break;
 
 		memset(piece, 0, sizeof(piece));
@@ -535,10 +539,10 @@ qllm_embed(struct qllm_context *qctx,
 	if (n_tokens == 0)
 		return -1;
 
-	if (qllm_decode_tokens(qctx, qctx->token_buf, n_tokens) != 0)
+	if (qllm_decode_tokens(qctx, qctx->token_buf, n_tokens, 1) != 0)
 		return -1;
 
-	embd = llama_get_embeddings(qctx->ctx);
+	embd = llama_get_embeddings_seq(qctx->ctx, 0);
 	if (!embd)
 		return -1;
 
@@ -573,7 +577,7 @@ qllm_prime(struct qllm_context *qctx,
 	if (n_prompt == 0)
 		return 0;
 
-	if (qllm_decode_tokens(qctx, qctx->token_buf, n_prompt) != 0)
+	if (qllm_decode_tokens(qctx, qctx->token_buf, n_prompt, 0) != 0)
 		return -1;
 
 	return 0;
@@ -601,7 +605,7 @@ qllm_next(struct qllm_context *qctx,
 
 	/* Advance KV with this token */
 	qctx->token_buf[0] = tok;
-	if (qllm_decode_tokens(qctx, qctx->token_buf, 1) != 0)
+	if (qllm_decode_tokens(qctx, qctx->token_buf, 1, 0) != 0)
 		return -1;
 
 	/* Convert token to text piece */
