@@ -1,4 +1,8 @@
-all := libqllm qllmd qllm-chat
+all := libqllm qllmd qllm-chat engine-test
+
+engine-test-obj-y := src/qllm-engine.o
+LDLIBS-engine-test := -lqllm -ljson-c -lpthread -lm
+bin/engine-test: src/qllm-engine.o
 INSTALL_BIN := qllmd qllm-chat qllm-path qllm-list
 
 libqllm-obj-y-Linux := src/vulkan.o
