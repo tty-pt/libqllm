@@ -48,18 +48,26 @@ matters when running from a source checkout.
   single-threaded event loop.
 
 ## Chat usage
-Follow these instructions to install [huggingface-cli](https://huggingface.co/docs/huggingface_hub/guides/cli) so you can download models you can run.
 
-Download a model, like:
+Download a small instruct model's GGUF directly with curl — no
+huggingface-cli needed. A 0.5B model is ~490 MB and runs on a CPU-only machine:
+
 ```sh
-huggingface-cli download reedmayhew/Grok-3-gemma3-4B-distilled gemma-3-finetune.Q8_0.gguf
+curl -L -o qwen2.5-0.5b-instruct-q4_k_m.gguf \
+    https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
 ```
 
-Run:
+Start the server and talk to it:
 ```sh
-QLLM_MODEL_PATH=gemma-3-finetune.Q8_0.gguf axil -A -d -p 4242 -m libaxil-qllm # To start the service
-qllm-chat # To talk to it
+QLLM_MODEL_PATH=qwen2.5-0.5b-instruct-q4_k_m.gguf axil -A -d -p 4242 -m libaxil-qllm # server
+qllm-chat                                                                             # chat client
 ```
+
+Bigger models answer better but need more RAM/VRAM. To pick a different GGUF
+from the Hugging Face Hub without installing the CLI, the pattern is
+`curl -L .../resolve/main/<file>`. For gated models you can instead install
+[huggingface-cli](https://huggingface.co/docs/huggingface_hub/guides/cli) and run
+`huggingface-cli download <org>/<repo> <file>`.
 
 Telnet chat also works:
 ```sh
