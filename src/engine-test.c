@@ -91,7 +91,7 @@ rec_last(int job_id)
 static void
 analyze_embed(struct result_rec *rec)
 {
-	struct json_object *o, *data, *item, *emb, *model;
+	struct json_object *o, *data, *item, *emb;
 	int n = 0, i;
 	double mv = 0.0;
 

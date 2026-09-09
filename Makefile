@@ -1,18 +1,39 @@
-all := libqllm qllmd qllm-chat engine-test
+all := libaxil-qllm engine-test
 
-engine-test-obj-y := src/qllm-engine.o
-LDLIBS-engine-test := -lqllm -ljson-c -lpthread -lm
-bin/engine-test: src/qllm-engine.o
-INSTALL_BIN := qllmd qllm-chat qllm-path qllm-list
+SITE ?= ${HOME}/site
 
-libqllm-obj-y-Linux := src/vulkan.o
-libqllm-obj-y-Darwin := src/metal.o
+SITE_INC := -I${SITE}/external/axil/include \
+	-I${SITE}/external/libxylem/include \
+	-I${SITE}/external/libqmap/include
 
-# qllmd-obj-y is pulled into the link recipe by include.mk. The generic
-# include.mk only wires BIN prerequisites from single-word ${BIN} lists, so
-# also add the object as an explicit link prerequisite.
-qllmd-obj-y := src/openai_embed.o src/openai_chat.o src/qllm-engine.o
-bin/qllmd: src/openai_embed.o src/openai_chat.o src/qllm-engine.o
+SITE_LIB := -L${SITE}/external/axil/lib \
+	-L${SITE}/external/libxylem/lib \
+	-L${SITE}/external/libqmap/lib \
+	-Wl,-rpath,${SITE}/external/axil/lib \
+	-Wl,-rpath,${SITE}/external/libxylem/lib \
+	-Wl,-rpath,${SITE}/external/libqmap/lib
+
+EXTRA_CFLAGS += ${SITE_INC}
+
+INSTALL_BIN := qllm-chat qllm-path qllm-list
+
+engine-test-obj-y :=
+LDLIBS-engine-test := -laxil-qllm -ljson-c -lpthread -lm
+LDFLAGS-engine-test = -Wl,-rpath,${pwd}/lib
+
+libaxil-qllm-obj-y := src/libqllm.o src/qllm-engine.o src/openai_embed.o src/openai_chat.o
+libaxil-qllm-obj-y-Linux := src/vulkan.o
+libaxil-qllm-obj-y-Darwin := src/metal.o
+
+LDLIBS-libaxil-qllm := -laxil -lxylem -lqmap -lqsys -ljson-c \
+	-lllama -lggml -lggml-cpu -lggml-base -ldl -lpthread -lm -lstdc++
+LDLIBS-libaxil-qllm-Linux := -lgomp -lvulkan -lggml-vulkan
+LDLIBS-libaxil-qllm-Darwin := -lggml-metal -lggml-blas -lomp \
+	-framework Foundation \
+	-framework CoreFoundation \
+	-framework IOKit \
+	-framework Metal \
+	-framework Accelerate
 
 llamacpp := submodules/llama.cpp/build
 
@@ -40,30 +61,14 @@ CFLAGS-Darwin := -I${omp}/include
 
 ggmlp := ${llamacpp}/ggml/src
 
-LDFLAGS-libqllm := -L${llamacpp}/src -L${ggmlp}
+LDFLAGS-libaxil-qllm := -L${llamacpp}/src -L${ggmlp} ${SITE_LIB}
 LDFLAGS-Linux := -L${ggmlp}/ggml-vulkan -L${vulkan}/lib
 LDFLAGS-Darwin := -L${ggmlp}/ggml-metal -L${ggmlp}/ggml-blas -L${omp}/lib
-
-LDLIBS-qllmd := -lqsys -laxil -lqllm -ljson-c -lpthread -lm
-
-LDLIBS-libqllm := -lllama -lggml -lggml-cpu -lggml-base -lqmap -ldl -lpthread -lm -lstdc++
-LDLIBS-libqllm-Linux := -lgomp -lvulkan -lggml-vulkan
-LDLIBS-libqllm-Darwin := -lggml-metal -lggml-blas -lomp \
-	-framework Foundation \
-	-framework CoreFoundation \
-	-framework IOKit \
-	-framework Metal \
-	-framework Accelerate
 
 CMAKE_FLAGS-Linux := -DGGML_VULKAN=ON
 CMAKE_FLAGS-Darwin := -DGGML_METAL=ON
 
 third_party-Linux := ${vulkan}/include/shaderc/shaderc.h
-
-completions := share/bash-completion/completions
-
-install-dirs := ${completions}
-install-extra := ${completions}/qllmd
 
 include ./../mk/include.mk
 

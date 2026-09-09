@@ -8,6 +8,7 @@
 
 #include "openai_chat.h"
 #include "qllm-engine.h"
+#include "qllm-pending.h"
 
 #include <ttypt/axil.h>
 
@@ -16,10 +17,6 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* Defined in qllmd.c; carries the deferred response handle for a job's ud. */
-typedef struct pending pending_t;
-extern pending_t *make_pending(void *handle, int mode, int sid);
 
 static void
 chat_respond_error(socket_t fd, int code, const char *msg)
