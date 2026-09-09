@@ -7,6 +7,23 @@ This project comes with a few tools for ease-of-use: an axil module (`libaxil-ql
 Check out [these instructions](https://github.com/tty-pt/ci/blob/main/docs/install.md#install-ttypt-packages).
 And use "libqllm" as the package name.
 
+The package installs the `libaxil-qllm` axil module, the `qllm-chat`, `qllm-list`
+and `qllm-path` tools, and the `qllm.h` header.
+
+## Building from source
+```sh
+git clone https://github.com/tty-pt/mk.git        # a sibling dir is expected
+git clone --recursive https://github.com/tty-pt/libqllm.git
+cd libqllm && make
+sudo make install
+```
+
+Dependencies: the `axil`, `libxylem`, `libqmap` and `libqsys` packages (from the
+tty.pt repo) provide the headers and libraries, or pass `SITE=/path/to/site` to
+use a site checkout instead of installed packages. The build downloads the
+LunarG Vulkan SDK and compiles `submodules/llama.cpp` from source, so `cmake`,
+`clang` and `wget` are also required.
+
 ## Running the server
 libqllm is served as the axil module `libaxil-qllm` (`lib/libaxil-qllm.so`). Pick the
 model with the `QLLM_MODEL_PATH` env var (required); `QLLM_CRB_PATH` optionally points
@@ -18,6 +35,10 @@ QLLM_MODEL_PATH=/path/to/model.gguf axil -A -d -p 4242 -m libaxil-qllm
 # run from ~/libqllm/lib so `-m libaxil-qllm` resolves, or pass an absolute
 # path without the ".so" suffix, e.g. -m /home/you/libqllm/lib/libaxil-qllm
 ```
+
+If you installed the `libqllm` package, `-m libaxil-qllm` resolves from
+anywhere (the module lives in `/usr/lib`); the working-directory hint above only
+matters when running from a source checkout.
 
 - `-A` auto-authenticates every connection; without it, axil gates
   `on_axil_disconnect` and telnet session cleanup never fires.
@@ -80,3 +101,17 @@ embeddings JSON shape (`data[0].embedding` float array).
 
 Note: mm's client caps vectors at 512 (VEC_MAX), so an 896-dim model like
 `qwen2.5-0.5b-instruct` will not scan in mm — the endpoint itself is correct.
+
+## Model selection
+
+The model is chosen once, at server start, via the required `QLLM_MODEL_PATH`
+env var (a `QLLM_CRB_PATH` env var optionally points at a system-prompt file,
+default `crb.txt` in the server's cwd). A model *name* may be resolved to a
+path with `qllm-path` in a later release.
+
+Looking ahead, selection is meant to become **per-request**: both HTTP endpoints
+already carry the OpenAI `model` field (today it only echoes `QLLM_MODEL_PATH`),
+and it will feed a model registry so one server can serve several models.
+Selecting models via extra axil command-line options was considered and
+deliberately passed on: axil's option parsing is core-owned, and a per-request
+`model` field is the right seam for the multi-model future.

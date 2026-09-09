@@ -1,19 +1,21 @@
-all := libaxil-qllm engine-test
+all := libaxil-qllm qllm-chat engine-test
 
 SITE ?= ${HOME}/site
 
-SITE_INC := -I${SITE}/external/axil/include \
+SITE_OK != test -d ${SITE}/external/axil/include && echo yes || true
+
+SITE_INC-yes := -I${SITE}/external/axil/include \
 	-I${SITE}/external/libxylem/include \
 	-I${SITE}/external/libqmap/include
 
-SITE_LIB := -L${SITE}/external/axil/lib \
+SITE_LIB-yes := -L${SITE}/external/axil/lib \
 	-L${SITE}/external/libxylem/lib \
 	-L${SITE}/external/libqmap/lib \
 	-Wl,-rpath,${SITE}/external/axil/lib \
 	-Wl,-rpath,${SITE}/external/libxylem/lib \
 	-Wl,-rpath,${SITE}/external/libqmap/lib
 
-EXTRA_CFLAGS += ${SITE_INC}
+EXTRA_CFLAGS += ${SITE_INC-${SITE_OK}}
 
 INSTALL_BIN := qllm-chat qllm-path qllm-list
 
@@ -61,7 +63,7 @@ CFLAGS-Darwin := -I${omp}/include
 
 ggmlp := ${llamacpp}/ggml/src
 
-LDFLAGS-libaxil-qllm := -L${llamacpp}/src -L${ggmlp} ${SITE_LIB}
+LDFLAGS-libaxil-qllm := -L${llamacpp}/src -L${ggmlp} ${SITE_LIB-${SITE_OK}}
 LDFLAGS-Linux := -L${ggmlp}/ggml-vulkan -L${vulkan}/lib
 LDFLAGS-Darwin := -L${ggmlp}/ggml-metal -L${ggmlp}/ggml-blas -L${omp}/lib
 
