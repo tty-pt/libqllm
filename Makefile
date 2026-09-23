@@ -1,22 +1,5 @@
 all := libaxil-qllm qllm-chat engine-test
 
-SITE ?= ${HOME}/site
-
-SITE_OK != test -d ${SITE}/external/axil/include && echo yes || true
-
-SITE_INC-yes := -I${SITE}/external/axil/include \
-	-I${SITE}/external/libxylem/include \
-	-I${SITE}/external/libcorm/include
-
-SITE_LIB-yes := -L${SITE}/external/axil/lib \
-	-L${SITE}/external/libxylem/lib \
-	-L${SITE}/external/libcorm/lib \
-	-Wl,-rpath,${SITE}/external/axil/lib \
-	-Wl,-rpath,${SITE}/external/libxylem/lib \
-	-Wl,-rpath,${SITE}/external/libcorm/lib
-
-EXTRA_CFLAGS += ${SITE_INC-${SITE_OK}}
-
 INSTALL_BIN := qllm-chat qllm-path qllm-list
 
 engine-test-obj-y :=
@@ -45,6 +28,9 @@ uname != uname
 arch := $(shell uname -m)
 arch != uname -m
 
+COMPILER_C   := $(shell command -v clang  >/dev/null 2>&1 && echo clang  || echo ${CC})
+COMPILER_CXX := $(shell command -v clang++ >/dev/null 2>&1 && echo clang++ || echo ${CXX})
+
 SDK_VERSION := 1.4.328.1
 SDK_URL := https://sdk.lunarg.com/sdk/download/${SDK_VERSION}/linux/vulkansdk-linux-${arch}-${SDK_VERSION}.tar.xz
 vulkan := third_party/${SDK_VERSION}/${arch}
@@ -63,7 +49,7 @@ CFLAGS-Darwin := -I${omp}/include
 
 ggmlp := ${llamacpp}/ggml/src
 
-LDFLAGS-libaxil-qllm := -L${llamacpp}/src -L${ggmlp} ${SITE_LIB-${SITE_OK}}
+LDFLAGS-libaxil-qllm := -L${llamacpp}/src -L${ggmlp}
 LDFLAGS-Linux := -L${ggmlp}/ggml-vulkan -L${vulkan}/lib
 LDFLAGS-Darwin := -L${ggmlp}/ggml-metal -L${ggmlp}/ggml-blas -L${omp}/lib
 
@@ -73,6 +59,12 @@ CMAKE_FLAGS-Darwin := -DGGML_METAL=ON
 third_party-Linux := ${vulkan}/include/shaderc/shaderc.h
 
 include ./../mk/include.mk
+
+${DESTDIR}${PREFIX}/lib/pkgconfig/axil-qllm.pc: axil-qllm.pc
+	install -d ${DESTDIR}${PREFIX}/lib/pkgconfig
+	install -m 644 axil-qllm.pc $@
+
+install: ${DESTDIR}${PREFIX}/lib/pkgconfig/axil-qllm.pc
 
 src/libqllm.o: $(llamacpp)/src/libllama.a
 
@@ -87,8 +79,8 @@ $(llamacpp)/Makefile: ${third_party-${uname}}
 	export VULKAN_SDK="$(abspath $(vulkan))" && \
 		export PATH="$$VULKAN_SDK/bin:$$PATH" && \
 		export LD_LIBRARY_PATH="$$VULKAN_SDK/lib:$$LD_LIBRARY_PATH" && \
-		export CC=clang && \
-		export CXX=clang++ && \
+		export CC=${COMPILER_C} && \
+		export CXX=${COMPILER_CXX} && \
 		cd ${llamacpp} && \
 		cmake .. ${CMAKE_FLAGS-${uname}} \
 			-DCMAKE_INSTALL_PREFIX:PATH=${PREFIX}/share/qllm \
@@ -105,3 +97,7 @@ $(vulkan)/include/shaderc/shaderc.h:
 	mkdir third_party || true
 	wget -qO third_party/vulkan-sdk.tar.xz "$(SDK_URL)"
 	tar -xf third_party/vulkan-sdk.tar.xz -C third_party
+
+.PHONY: test
+test:
+	$(MAKE) -C tests run

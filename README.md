@@ -1,34 +1,117 @@
 # libqllm
-This is a library that is focused on making LLM usage easy and portable. The idea is you don't have to bother about CUDA or anything like that. You just install it via your favorite package manager, and then you can use it to do inference and generate embeddings. It is a wrap around llama-cpp, but with a simple interface and the build complexity hidden. It uses Vulkan on Linux and Metal on MacOS to allow for this portability.
 
-This project comes with a few tools for ease-of-use: an axil module (`libaxil-qllm`) that serves chat sessions and OpenAI-compatible HTTP endpoints, a client program (`qllm-chat`), bash completion, `qllm-list` for listing your gguf models, and `qllm-path` for getting the real path to one.
+[![C99](https://img.shields.io/badge/C-C99-555?logo=c)](#)
+[![BSD-2-Clause](https://img.shields.io/badge/License-BSD--2--Clause-blue)](#)
+[![Vulkan/Metal](https://img.shields.io/badge/Vulkan%2FMetal-backends-4B8BBE)](#)
 
-## Installation
-Check out [these instructions](https://github.com/tty-pt/ci/blob/main/docs/install.md#install-ttypt-packages).
-And use "libqllm" as the package name.
+> Local LLM inference and embeddings via llama.cpp, served as an axil module.
 
-The package installs the `libaxil-qllm` axil module, the `qllm-chat`, `qllm-list`
-and `qllm-path` tools, and the `qllm.h` header.
+Making LLM usage easy and portable: no CUDA to worry about, no build
+complexity to deal with. You install it through your favorite package manager
+and use it for inference and embeddings. It wraps llama.cpp behind a single C
+API, and uses Vulkan on Linux and Metal on macOS for that portability.
 
-## Building from source
+It ships as the axil module `libaxil-qllm`, which serves chat sessions and
+OpenAI-compatible HTTP endpoints, together with a client program (`qllm-chat`),
+bash completion, `qllm-list` for listing your GGUF models, and `qllm-path` for
+getting the real path to one.
+
+## Contents
+
+- [Features](#features)
+- [Install](#install)
+- [Build from source](#build-from-source)
+- [Quickstart](#quickstart)
+- [Running the server](#running-the-server)
+- [Chat usage](#chat-usage)
+- [OpenAI-compatible HTTP API](#openai-compatible-http-api)
+- [Model selection](#model-selection)
+- [C API](#c-api)
+- [Testing](#testing)
+- [Documentation](#documentation)
+- [License](#license)
+
+## Features
+
+- **Easy and portable** — no CUDA; install via your package manager and
+  generate text or embeddings right away.
+- **An axil module** — `libaxil-qllm` runs inside axil: telnet `ask`/`chat`
+  commands and OpenAI-compatible HTTP endpoints (`/v1/chat/completions`,
+  `/v1/embeddings`).
+- **Worker-thread inference** — generation runs on the module's worker thread
+  and never blocks axil's single-threaded event loop.
+- **Portable backends** — Vulkan on Linux, Metal on macOS, all the CUDA pain
+  hidden from you.
+- **Sliding-window contexts** — long sessions survive limited context sizes via
+  anchored `qllm_compress`, with multi-context accounting and a refcounted
+  model cache.
+- **Constrained decoding** — GBNF grammars via `qllm_set_grammar` and the
+  sampler API.
+- **Tools** — `qllm-chat` (chat client), `qllm-list` (list your GGUF models),
+  `qllm-path` (resolve a model's real path).
+- **One C API** — generation, streaming, embeddings and conversation history
+  through `include/ttypt/qllm.h`.
+
+## Install
+
+Prebuilt packages are distributed from [tty.pt](https://tty.pt) for Linux (APT
+/ Alpine / Arch / Fedora-RHEL), macOS (Homebrew), Windows (winget / MSYS2), and
+OpenBSD. Follow the [installation instructions]
+(https://github.com/tty-pt/ci/blob/main/docs/install.md) and use **libqllm**
+as the package name.
+
+The package installs the `libaxil-qllm` axil module, the `qllm-chat`,
+`qllm-list` and `qllm-path` tools, and the `qllm.h` header.
+
+## Build from source
+
 ```sh
 git clone https://github.com/tty-pt/mk.git        # a sibling dir is expected
 git clone --recursive https://github.com/tty-pt/libqllm.git
 cd libqllm && make
-sudo make install
+make test             # run the in-tree mock-based test suite
+sudo make install     # lib + headers + axil-qllm.pc -> $(PREFIX), default /usr
 ```
 
-Dependencies: the `axil`, `libxylem`, `libcorm` and `libqsys` packages (from the
-tty.pt repo) provide the headers and libraries, or pass `SITE=/path/to/site` to
-use a site checkout instead of installed packages. The build downloads the
-LunarG Vulkan SDK and compiles `submodules/llama.cpp` from source, so `cmake`,
-`clang` and `wget` are also required.
+Link it from your own C code:
+
+```sh
+cc my_app.c $(pkg-config --cflags --libs axil-qllm)
+```
+
+**Dependencies:** the `axil`, `libxylem`, `libcorm` and `libqsys` packages
+(from the tty.pt repo) provide the headers and libraries, or pass
+`SITE=/path/to/site` to use a site checkout instead of installed packages. The
+build downloads the LunarG Vulkan SDK and compiles `submodules/llama.cpp` from
+source, so `cmake`, `clang` and `wget` are also required.
+
+## Quickstart
+
+```c
+#include <stdio.h>
+#include <ttypt/qllm.h>
+
+int main(int argc, char **argv)
+{
+	struct qllm_config cfg = { .model_path = argv[1] };
+	struct qllm_context *ctx = qllm_create(&cfg);
+	char out[1024];
+	long n = qllm_generate(ctx, "tell me a joke", out, sizeof out);
+
+	if (n < 0)
+		return 1;
+	printf("%.*s\n", (int)n, out);
+	qllm_free(ctx);
+	return 0;
+}
+```
 
 ## Running the server
-libqllm is served as the axil module `libaxil-qllm` (`lib/libaxil-qllm.so`). Pick the
-model with the `QLLM_MODEL_PATH` env var (required); `QLLM_CRB_PATH` optionally points
-at a system-prompt file (default `crb.txt` relative to the server's cwd, skipped if
-absent).
+
+libqllm is served as the axil module `libaxil-qllm` (`lib/libaxil-qllm.so`).
+Pick the model with the `QLLM_MODEL_PATH` env var (required); `QLLM_CRB_PATH`
+optionally points at a system-prompt file (default `crb.txt` relative to the
+server's cwd, skipped if absent).
 
 ```sh
 QLLM_MODEL_PATH=/path/to/model.gguf axil -A -d -p 4242 -m libaxil-qllm
@@ -37,8 +120,8 @@ QLLM_MODEL_PATH=/path/to/model.gguf axil -A -d -p 4242 -m libaxil-qllm
 ```
 
 If you installed the `libqllm` package, `-m libaxil-qllm` resolves from
-anywhere (the module lives in `/usr/lib`); the working-directory hint above only
-matters when running from a source checkout.
+anywhere (the module lives in `/usr/lib`); the working-directory hint above
+only matters when running from a source checkout.
 
 - `-A` auto-authenticates every connection; without it, axil gates
   `on_axil_disconnect` and telnet session cleanup never fires.
@@ -123,3 +206,48 @@ and it will feed a model registry so one server can serve several models.
 Selecting models via extra axil command-line options was considered and
 deliberately passed on: axil's option parsing is core-owned, and a per-request
 `model` field is the right seam for the multi-model future.
+
+## C API
+
+Everything lives in `<ttypt/qllm.h>`; all functions are `extern "C"`-safe.
+
+- **Configuration / lifecycle** — `struct qllm_config` (all fields optional
+  except `model_path`), `qllm_create`, `qllm_free`.
+- **Generation** — `qllm_generate` (into a user buffer), `qllm_generate_stream`
+  (`qllm_token_cb` per chunk), `qllm_next` (one token, with an explicit
+  sampler).
+- **Embeddings** — `qllm_embed` (mean-pooled; needs
+  `enable_embeddings` in the config).
+- **Sampling & grammar** — `qllm_set_grammar`, plus the sampler chain
+  `qllm_sampler_create`, `qllm_sampler_add_grammar`, `qllm_sampler_free`.
+- **Conversation & context** — `qllm_prime`, `qllm_chat` (streaming chat
+  completion over `struct qllm_message`), `qllm_render`, `qllm_reset`,
+  `qllm_set_seq` (multi-sequence), `qllm_n_ctx`.
+- **Sliding window** — `qllm_anchor_start` / `qllm_anchor_end` protect the
+  current prompt+response, `qllm_compress` evicts older tokens, and
+  `qllm_set_eos_bias` makes long generations terminate on their own.
+
+## Testing
+
+`make test` (delegates to `tests/Makefile`). The suite compiles
+`src/libqllm.c` against **mocks** for llama/gguf/corm/vulkan
+(`tests/mocks/`), so it runs without a model or GPU:
+
+- `tests/unit/core/` — model cache refcounts, compression, context creation,
+  generation, extended API behavior.
+- `tests/edge/` — edge cases (`tests/edge/test_edge_cases.c`).
+- `tests/stress/` — long-running scenarios (`tests/stress/test_stress.c`).
+
+## Documentation
+
+- [include/ttypt/qllm.h](./include/ttypt/qllm.h) — full API (Doxygen-annotated;
+  `make docs` generates man pages).
+- [CHANGELOG.md](./CHANGELOG.md) — version history.
+- [PORT.md](./PORT.md) — porting notes.
+- [IMPLEMENTATION_STATUS.md](./IMPLEMENTATION_STATUS.md) — implementation
+  status.
+
+## License
+
+BSD 2-Clause License. Copyright 2026 Paulo André Azevedo Quirino. See
+`LICENSE`.

@@ -1,0 +1,10 @@
+prefix=/usr/local
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: axil-qllm
+Description: Local LLM inference and embeddings via llama.cpp (axil module)
+Version: 1.1.0
+Libs: -L${libdir} -laxil-qllm -laxil -lxylem -lcorm -lqsys -ljson-c
+Cflags: -I${includedir}

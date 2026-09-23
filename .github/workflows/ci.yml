@@ -15,7 +15,7 @@ jobs:
       deps_apk: "axil,libxylem,libqsys,libcorm,vulkan-loader,vulkan-loader-dev,vulkan-headers,vulkan-tools,cmake,xz,wget,json-c-dev"
       deps_rpm: "axil,libxylem,libqsys,libcorm,vulkan-headers,vulkan-loader,vulkan-loader-devel,vulkan-tools,glslang,cmake,wget,g++,json-c-devel"
       deps_brew: "axil,libxylem,libqsys,libcorm,cmake,libomp,json-c"
-      publish_to: "deb,pacman,rpm,brew"
+      publish_to: "deb,rpm,brew"
     secrets:
       HOST: ${{ secrets.OPENBSD_HOST }}
       USER: ${{ secrets.OPENBSD_USER }}
