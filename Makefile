@@ -6,14 +6,14 @@ SITE_OK != test -d ${SITE}/external/axil/include && echo yes || true
 
 SITE_INC-yes := -I${SITE}/external/axil/include \
 	-I${SITE}/external/libxylem/include \
-	-I${SITE}/external/libqmap/include
+	-I${SITE}/external/libcorm/include
 
 SITE_LIB-yes := -L${SITE}/external/axil/lib \
 	-L${SITE}/external/libxylem/lib \
-	-L${SITE}/external/libqmap/lib \
+	-L${SITE}/external/libcorm/lib \
 	-Wl,-rpath,${SITE}/external/axil/lib \
 	-Wl,-rpath,${SITE}/external/libxylem/lib \
-	-Wl,-rpath,${SITE}/external/libqmap/lib
+	-Wl,-rpath,${SITE}/external/libcorm/lib
 
 EXTRA_CFLAGS += ${SITE_INC-${SITE_OK}}
 
@@ -27,7 +27,7 @@ libaxil-qllm-obj-y := src/libqllm.o src/qllm-engine.o src/openai_embed.o src/ope
 libaxil-qllm-obj-y-Linux := src/vulkan.o
 libaxil-qllm-obj-y-Darwin := src/metal.o
 
-LDLIBS-libaxil-qllm := -laxil -lxylem -lqmap -lqsys -ljson-c \
+LDLIBS-libaxil-qllm := -laxil -lxylem -lcorm -lqsys -ljson-c \
 	-lllama -lggml -lggml-cpu -lggml-base -ldl -lpthread -lm -lstdc++
 LDLIBS-libaxil-qllm-Linux := -lgomp -lvulkan -lggml-vulkan
 LDLIBS-libaxil-qllm-Darwin := -lggml-metal -lggml-blas -lomp \

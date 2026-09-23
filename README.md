@@ -18,7 +18,7 @@ cd libqllm && make
 sudo make install
 ```
 
-Dependencies: the `axil`, `libxylem`, `libqmap` and `libqsys` packages (from the
+Dependencies: the `axil`, `libxylem`, `libcorm` and `libqsys` packages (from the
 tty.pt repo) provide the headers and libraries, or pass `SITE=/path/to/site` to
 use a site checkout instead of installed packages. The build downloads the
 LunarG Vulkan SDK and compiles `submodules/llama.cpp` from source, so `cmake`,

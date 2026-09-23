@@ -15,7 +15,7 @@
 #include <gguf.h>
 
 #include <ttypt/qsys.h>
-#include <ttypt/qmap.h>
+#include <ttypt/corm.h>
 
 struct qllm_context {
 	struct llama_model	*model;
@@ -89,8 +89,8 @@ shared_model_unref(struct llama_model *m)
 __attribute__((constructor)) void 
 qllm_init(void)
 {
-	qm_model = qmap_reg(sizeof(struct llama_model *));
-	model_hd = qmap_open(NULL, NULL, QM_STR, qm_model, 0, 0);
+	qm_model = corm_reg(sizeof(struct llama_model *));
+	model_hd = corm_open(NULL, NULL, CM_STR, qm_model, 0, 0);
 	llama_backend_init();
 	qllm_backend_inited = 1;
 }
@@ -280,7 +280,7 @@ struct llama_model *model_load(
 
 	pthread_mutex_lock(&model_lock);
 
-	model_r = (struct llama_model **) qmap_get(model_hd, path);
+	model_r = (struct llama_model **) corm_get(model_hd, path);
 	if (model_r) {
 		model = *model_r;
 		shared_model_ref(model);
@@ -320,7 +320,7 @@ struct llama_model *model_load(
 		return NULL;
 	}
 
-	qmap_put(model_hd, path, &model);
+	corm_put(model_hd, path, &model);
 	shared_model_ref(model);
 	pthread_mutex_unlock(&model_lock);
 	return model;
