@@ -1,2 +1,2 @@
-PROJECT_NAME           = "Qllm"
+PROJECT_NAME           = "qllm"
 @INCLUDE = ../mk/Doxyfile

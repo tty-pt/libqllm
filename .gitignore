@@ -1,6 +1,7 @@
 *.o
 *.d
 /lib
+/man
 /usr
 /third_party
 /bin
